@@ -1,0 +1,42 @@
+# Node
+node_modules/
+npm-debug.log*
+pnpm-lock.yaml
+yarn.lock
+
+# Frontend build
+FRONTEND/dist/
+FRONTEND/.cache/
+FRONTEND/.vite/
+FRONTEND/output.css
+
+# Backend dados/mídias/sessão
+BACKEND/data/
+BACKEND/uploads/
+BACKEND/.wpp-data/
+BACKEND/*.log
+
+# SQLite (se quiser ignorar o DB)
+BACKEND/data/bot.db
+BACKEND/data/*.db*
+*.sqlite
+*.sqlite-journal
+
+# Env
+**/.env
+.env
+.env.*.local
+
+# Docker (ajuste se usar override local)
+docker-compose.override.yml
+
+# OS / editores
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Coverage e caches
+coverage/
+.cache/
