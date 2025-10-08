@@ -231,8 +231,19 @@ export const AppProvider = ({ children }) => {
       try {
         const res = await fetch(`${API}/api/qr`);
         if (res.ok) {
-          const data = await res.json();
-          if (data?.base64Qr) setQrCode(data.base64Qr);
+          // Agora /api/qr retorna text/plain com o base64 cru.
+          // Ainda assim, deixamos robusto para aceitar JSON legado.
+          const text = await res.text();
+          if (text && text.trim().startsWith('{')) {
+            // legado: { ok:true, base64Qr: "..." }
+            try {
+              const obj = JSON.parse(text);
+              const val = obj?.base64 || obj?.base64Qr;
+              if (val) setQrCode(String(val).trim());
+            } catch {}
+          } else if (text) {
+            setQrCode(String(text).trim());
+          }
         }
       } catch {}
     })();
@@ -247,7 +258,12 @@ export const AppProvider = ({ children }) => {
     });
 
     socket.on('wpp:status', (s) => { setStatus(s || {}); setError(null); if (!s) setQrCode(null); });
-    socket.on('wpp:qr', (p) => { setQrCode(p?.base64Qr || null); setError(null); });
+    socket.on('wpp:qr', (p) => {
+      // aceita ambos os nomes (base64 e base64Qr) para compatibilidade
+      const val = p?.base64 || p?.base64Qr || null;
+      setQrCode(val);
+      setError(null);
+    });
     socket.on('counter:update', (row) => {
       if (row?.group_id) setCounters((prev) => ({ ...prev, [row.group_id]: row }));
     });
