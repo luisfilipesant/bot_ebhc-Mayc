@@ -296,7 +296,7 @@ async function createSession(ioInstance) {
 
   if (client && isConnected()) {
     io.emit('wpp:status', statusCache);
-    if (qrCacheBase64) io.emit('wpp:qr', { base64Qr: qrCacheBase64, attempts: 0 });
+    if (qrCacheBase64) io.emit('wpp:qr', { base64: qrCacheBase64, base64Qr: qrCacheBase64, attempts: 0 });
     return client;
   }
 
@@ -316,9 +316,22 @@ async function createSession(ioInstance) {
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox'],
     },
-    catchQR: (base64Qr, asciiQR, attempts) => {
-      qrCacheBase64 = base64Qr;
-      io.emit('wpp:qr', { base64Qr, attempts });
+    catchQR: (base64Qr, asciiQR, attempts /*, urlCode */) => {
+      // Normaliza para guardar APENAS o base64 cru, sem prefixo nem espaços/quebras de linha
+      const raw = String(base64Qr || '')
+        .replace(/^data:image\/png;base64,?/i, '')
+        .replace(/\s+/g, '');
+
+      qrCacheBase64 = raw || null;
+
+      // status auxiliar opcional
+      if (!isConnected()) {
+        statusCache = { status: 'QR' };
+        io.emit('wpp:status', statusCache);
+      }
+
+      // Emite em ambos os nomes para compatibilidade (base64 e base64Qr)
+      io.emit('wpp:qr', { base64: qrCacheBase64, base64Qr: qrCacheBase64, attempts: Number(attempts) || 0 });
     },
     statusFind: (statusSession) => {
       statusCache = { status: statusSession };

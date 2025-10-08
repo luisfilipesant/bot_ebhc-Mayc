@@ -60,7 +60,7 @@ const sanitizeSnapshotMessages = (arr) => {
 io.on('connection', (socket) => {
   socket.emit('wpp:status', bot.getStatus());
   const qr = bot.getQR();
-  if (qr) socket.emit('wpp:qr', { base64Qr: qr, attempts: 0 });
+  if (qr) socket.emit('wpp:qr', { base64: qr, base64Qr: qr, attempts: 0 });
 });
 
 // --- API ---
@@ -76,8 +76,9 @@ app.get('/api/status', async (req, res) => {
 // Fallback QR (útil ao recarregar a página)
 app.get('/api/qr', (req, res) => {
   const qr = bot.getQR();
-  if (!qr) return res.status(404).json({ ok: false, error: 'QR indisponível' });
-  res.json({ ok: true, base64Qr: qr });
+  if (!qr) return res.status(404).type('application/json').send(JSON.stringify({ ok: false, error: 'QR indisponível' }));
+  // >>> Agora devolvemos APENAS o base64 cru em text/plain (sem JSON)
+  res.type('text/plain').send(qr);
 });
 
 app.post('/api/bot/start', async (req, res) => {
@@ -87,7 +88,7 @@ app.post('/api/bot/start', async (req, res) => {
   } else {
     io.emit('wpp:status', bot.getStatus());
     const qr = bot.getQR();
-    if (qr) io.emit('wpp:qr', { base64Qr: qr, attempts: 0 });
+    if (qr) io.emit('wpp:qr', { base64: qr, base64Qr: qr, attempts: 0 });
   }
   res.json({ ok: true, settings: s });
 });
