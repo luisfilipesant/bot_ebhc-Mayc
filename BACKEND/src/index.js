@@ -35,13 +35,6 @@ const cleanPath = (p) => {
   const s = String(p).trim();
   return s ? s : null;
 };
-const isEmptySnapshotMessage = (m) => {
-  if (!m) return true;
-  const txt = trimStr(m.text);
-  const img = cleanPath(m.image_path);
-  const aud = cleanPath(m.audio_path);
-  return !txt && !img && !aud;
-};
 const sanitizeSnapshotMessages = (arr) => {
   if (!Array.isArray(arr)) return [];
   const out = [];
@@ -49,9 +42,9 @@ const sanitizeSnapshotMessages = (arr) => {
     const text = trimStr(m?.text);
     const image_path = cleanPath(m?.image_path);
     const audio_path = cleanPath(m?.audio_path);
-    // ignora totalmente mensagens "vazias"
-    if (!text && !image_path && !audio_path) continue;
-    out.push({ text, image_path, audio_path });
+    const video_path = cleanPath(m?.video_path); // <- suporte a vídeo no snapshot
+    if (!text && !image_path && !audio_path && !video_path) continue;
+    out.push({ text, image_path, audio_path, video_path });
   }
   return out;
 };
@@ -60,7 +53,7 @@ const sanitizeSnapshotMessages = (arr) => {
 io.on('connection', (socket) => {
   socket.emit('wpp:status', bot.getStatus());
   const qr = bot.getQR();
-  if (qr) socket.emit('wpp:qr', { base64: qr, base64Qr: qr, attempts: 0 });
+  if (qr) socket.emit('wpp:qr', { base64Qr: qr, attempts: 0 });
 });
 
 // --- API ---
@@ -73,12 +66,11 @@ app.get('/api/status', async (req, res) => {
   });
 });
 
-// Fallback QR (útil ao recarregar a página)
+// Fallback QR
 app.get('/api/qr', (req, res) => {
   const qr = bot.getQR();
-  if (!qr) return res.status(404).type('application/json').send(JSON.stringify({ ok: false, error: 'QR indisponível' }));
-  // >>> Agora devolvemos APENAS o base64 cru em text/plain (sem JSON)
-  res.type('text/plain').send(qr);
+  if (!qr) return res.status(404).json({ ok: false, error: 'QR indisponível' });
+  res.json({ ok: true, base64Qr: qr });
 });
 
 app.post('/api/bot/start', async (req, res) => {
@@ -88,7 +80,7 @@ app.post('/api/bot/start', async (req, res) => {
   } else {
     io.emit('wpp:status', bot.getStatus());
     const qr = bot.getQR();
-    if (qr) io.emit('wpp:qr', { base64: qr, base64Qr: qr, attempts: 0 });
+    if (qr) io.emit('wpp:qr', { base64Qr: qr, attempts: 0 });
   }
   res.json({ ok: true, settings: s });
 });
@@ -120,45 +112,74 @@ app.get('/api/groups', async (req, res) => {
 
 // settings globais
 app.post('/api/settings', async (req, res) => {
-  const payload = pick(req.body, ['enabled','threshold','text_message','send_to_all','selected_groups']);
+  const payload = pick(req.body, [
+    'enabled','threshold','text_message','send_to_all','selected_groups','random_mode','global_template_id'
+  ]);
   const updated = store.updateSettings(payload);
   res.json({ ok: true, settings: updated });
 });
 
-// mídia global
-app.post('/api/media',
-  upload.fields([{ name: 'image', maxCount: 1 }, { name: 'audio', maxCount: 1 }]),
+// ---------- MÍDIA GLOBAL ----------
+app.post(
+  '/api/media',
+  upload.fields([
+    { name: 'image', maxCount: 1 },
+    { name: 'audio', maxCount: 1 },
+    { name: 'video', maxCount: 1 }, // <- aceita vídeo opcional
+  ]),
   (req, res) => {
     const files = req.files || {};
     const image = (files.image && files.image[0]) ? files.image[0].path : undefined;
     const audio = (files.audio && files.audio[0]) ? files.audio[0].path : undefined;
-    const updated = store.updateSettings({ image_path: image, audio_path: audio });
-    res.json({ ok: true, settings: updated });
+    const video = (files.video && files.video[0]) ? files.video[0].path : undefined;
+
+    // Mantém compatibilidade: store.updateSettings não precisa ter video_path no schema;
+    // se existir no store, ótimo; senão, a chave extra é simplesmente ignorada.
+    const updated = store.updateSettings({ image_path: image, audio_path: audio, video_path: video });
+
+    res.json({
+      ok: true,
+      settings: updated,
+      media: {
+        image_path: image ? path.resolve(image) : null,
+        audio_path: audio ? path.resolve(audio) : null,
+        video_path: video ? path.resolve(video) : null,
+      }
+    });
   }
 );
 
-// ---------- Mídia por MENSAGEM do catálogo (template), independente da global ----------
-app.post('/api/catalog-media',
-  upload.fields([{ name: 'image', maxCount: 1 }, { name: 'audio', maxCount: 1 }]),
+// ---------- MÍDIA por TEMPLATE (Catálogo) ----------
+app.post(
+  '/api/catalog-media',
+  upload.fields([
+    { name: 'image', maxCount: 1 },
+    { name: 'audio', maxCount: 1 },
+    { name: 'video', maxCount: 1 }, // <- aceita vídeo
+  ]),
   (req, res) => {
     try {
       const files = req.files || {};
       const img = (files.image && files.image[0]) || null;
       const aud = (files.audio && files.audio[0]) || null;
+      const vid = (files.video && files.video[0]) || null;
 
-      if (!img && !aud) {
-        return res.status(400).json({ ok: false, error: 'Envie "image" ou "audio".' });
+      if (!img && !aud && !vid) {
+        return res.status(400).json({ ok: false, error: 'Envie "image", "audio" ou "video".' });
       }
 
-      const file = img || aud;
-      const abs = path.resolve(file.path); // caminho absoluto no FS para usar em sendFile
-      const rel = path.relative(path.join(__dirname, '..'), abs).replace(/\\/g, '/'); // "uploads/<arquivo>"
+      // Se vier mais de um, prioriza image > audio > video (padrão antigo mantido; compatibilidade)
+      const file = img || aud || vid;
+      const abs = path.resolve(file.path);
+      const rel = path
+        .relative(path.join(__dirname, '..'), abs)
+        .replace(/\\/g, '/');
 
       return res.json({
         ok: true,
-        type: img ? 'image' : 'audio',
-        path: abs, // usar este no template/preset (messages_json.image_path/audio_path)
-        rel      // útil no front para exibir nome/caminho relativo se quiser
+        type: img ? 'image' : aud ? 'audio' : 'video',
+        path: abs,
+        rel
       });
     } catch (e) {
       console.error('catalog-media error', e);
@@ -200,16 +221,22 @@ app.put('/api/templates/:id', (req, res) => {
 app.delete('/api/templates/:id', (req, res) => {
   try {
     const id = Number(req.params.id);
-    store.deleteTemplate(id);
-    // >>> NOVO: limpar o template_id de presets que referenciavam esse template
+    // limpa template_id dos presets
     store.clearTemplateFromPresets(id);
+    // se for o template global, limpa nas settings
+    const s = store.getSettings();
+    if (s.global_template_id === id) {
+      store.updateSettings({ global_template_id: null });
+    }
+    // remove o template
+    store.deleteTemplate(id);
     res.json({ ok: true });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message || 'Falha ao remover template' });
   }
 });
 
-// ---------- Presets por grupo (JSON completo) ----------
+// ---------- Presets por grupo ----------
 app.get('/api/group-presets', (req, res) => {
   res.json(store.getAllGroupPresets());
 });
@@ -218,42 +245,66 @@ app.post('/api/group-presets', (req, res) => {
   const body = req.body || {};
   if (!body.group_id) return res.status(400).json({ ok:false, error:'group_id é obrigatório' });
 
-  // HIGIENIZAÇÃO DO SNAPSHOT:
-  // - Remove entradas vazias (sem texto e sem mídia)
-  // - Normaliza texto (trim) e paths ('' -> null)
-  const sanitizedMessages = sanitizeSnapshotMessages(body.messages);
-
-  // >>> NOVO: validação do template_id, se vier
-  let tplId = null;
-  if (body.template_id !== undefined && body.template_id !== null) {
-    const requested = Number(body.template_id);
-    if (!Number.isFinite(requested) || !store.templateExists(requested)) {
-      return res.status(400).json({ ok:false, error: 'template_id inválido (template não existe)' });
-    }
-    tplId = requested;
+  // valida template (se informado)
+  if (body.template_id != null && !store.templateExists(body.template_id)) {
+    return res.status(400).json({ ok:false, error:'template_id inexistente' });
   }
+
+  const sanitizedMessages = sanitizeSnapshotMessages(body.messages);
 
   const saved = store.setGroupPreset(body.group_id, {
     enabled: body.enabled,
     threshold: body.threshold,
     cooldown_sec: body.cooldown_sec,
-    selected_index: body.selected_index, // compat com catálogo antigo
-    template_id: tplId,                  // validado acima (ou null)
+    selected_index: body.selected_index,
+    template_id: body.template_id != null ? Number(body.template_id) : null,
     messages: sanitizedMessages
   });
 
   res.json({ ok:true, preset: saved });
 });
 
-// upload de mídia por grupo (para vincular nas mensagens, se precisar)
-app.post('/api/group-media/:groupId',
-  upload.fields([{ name: 'image', maxCount: 1 }, { name: 'audio', maxCount: 1 }]),
+// ---------- BULK: ativar em todos ----------
+app.post('/api/groups/activate-all', (req, res) => {
+  const body = req.body || {};
+  const mode = (body.mode === 'random') ? 'random' : 'fixed';
+  const enable = !!body.enable;
+
+  if (mode === 'fixed') {
+    if (body.template_id == null) {
+      return res.status(400).json({ ok:false, error:'Informe template_id no modo fixo' });
+    }
+    if (!store.templateExists(body.template_id)) {
+      return res.status(400).json({ ok:false, error:'template_id inexistente' });
+    }
+  }
+
+  const presets = store.activateAllGroups({
+    enable,
+    mode,
+    template_id: (body.template_id != null ? Number(body.template_id) : null),
+    threshold: (body.threshold != null ? Number(body.threshold) : undefined),
+    cooldown_sec: (body.cooldown_sec != null ? Number(body.cooldown_sec) : undefined)
+  });
+
+  res.json({ ok:true, presets, settings: store.getSettings() });
+});
+
+// ---------- upload de mídia por grupo ----------
+app.post(
+  '/api/group-media/:groupId',
+  upload.fields([
+    { name: 'image', maxCount: 1 },
+    { name: 'audio', maxCount: 1 },
+    { name: 'video', maxCount: 1 }, // <- aceita vídeo por grupo
+  ]),
   (req, res) => {
     const { groupId } = req.params;
     const files = req.files || {};
     const out = {
       image_path: (files.image && files.image[0]) ? path.resolve(files.image[0].path) : undefined,
-      audio_path: (files.audio && files.audio[0]) ? path.resolve(files.audio[0].path) : undefined
+      audio_path: (files.audio && files.audio[0]) ? path.resolve(files.audio[0].path) : undefined,
+      video_path: (files.video && files.video[0]) ? path.resolve(files.video[0].path) : undefined,
     };
     res.json({ ok:true, files: out, groupId });
   }
@@ -273,14 +324,10 @@ app.post('/api/counters/reset/:groupId', (req, res) => {
   res.json({ ok: true, counter: row });
 });
 
-// ---------- SERVIR O FRONT BUILDADO ----------
-// 1) arquivos enviados pelo painel
+// ---------- SERVIR O FRONT ----------
 app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
-
-// 2) apontar para a pasta do build do front
 const clientPath = path.resolve(__dirname, '..', '..', 'FRONTEND', 'dist');
 
-// 3) servir estáticos do build (bundle.js, output.css, assets/*, etc.)
 app.use(express.static(clientPath, {
   index: 'index.html',
   setHeaders: (res, filePath) => {
@@ -289,13 +336,12 @@ app.use(express.static(clientPath, {
   },
 }));
 
-// 4) SPA fallback: qualquer rota que não seja /api ou /socket.io retorna index.html
 app.get(/^\/(?!api\/|socket\.io\/).*/, (req, res) => {
   res.sendFile(path.join(clientPath, 'index.html'));
 });
-// --------------------------------------------
 
 server.listen(PORT, async () => {
   console.log(`Servidor rodando em http://localhost:${PORT}`);
-  // opcional: await bot.createSession(io);
+  // opcional: start automático
+  // await bot.createSession(io);
 });

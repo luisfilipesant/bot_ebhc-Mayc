@@ -17,6 +17,10 @@ const inFlight = new Set(); // evita disparo duplicado por corrida
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 const nowISO = () => new Date().toISOString();
 
+// Limite de vídeo: default 16 MB (ajuste via env WPP_VIDEO_MAX_MB, ex.: 100 para ~100MB)
+const MAX_VIDEO_MB = Number(process.env.WPP_VIDEO_MAX_MB || 16);
+const MAX_VIDEO_BYTES = Math.max(1, Math.floor(MAX_VIDEO_MB)) * 1024 * 1024;
+
 function normalizeStatus(s) {
   if (!s) return '';
   return String(s).trim().toLowerCase();
@@ -59,7 +63,24 @@ function isEmptySnapshotMessage(m) {
   const txt = textOf(m.text);
   const img = cleanMediaPath(m.image_path);
   const aud = cleanMediaPath(m.audio_path);
-  return !txt && !img && !aud;
+  const vid = cleanMediaPath(m.video_path); // <- vídeo considerado
+  return !txt && !img && !aud && !vid;
+}
+
+function isVideoMime(m) {
+  if (!m) return false;
+  return String(m).toLowerCase().startsWith('video/');
+}
+function fileTooLarge(filePath, mimeType) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return false;
+    // Só aplicamos limite rígido para vídeo
+    if (!isVideoMime(mimeType)) return false;
+    const { size } = fs.statSync(filePath);
+    return size > MAX_VIDEO_BYTES;
+  } catch {
+    return false;
+  }
 }
 
 /** Busca grupos de forma estável usando listChats() e retries */
@@ -106,82 +127,122 @@ function shouldTargetGroup(groupId) {
 }
 
 /**
- * Mensagem efetiva (prioridade):
- *  1) Snapshot do PRESET (se existir e NÃO for vazio)
- *  2) Template por template_id (se existir)
- *  3) Global
+ * Resolve a mensagem efetiva a ser enviada ao grupo, com cascata:
+ *  1) PRESET do grupo:
+ *      1.1) snapshot messages (com rotate_index) — se não-vazias
+ *      1.2) template do grupo (template_id), se existir
+ *  2) GLOBAL:
+ *      2.1) template global fixo (global_template_id), se existir
+ *      2.2) modo randômico (random_mode) => pickRandomTemplate()
+ *      2.3) texto/mídia globais (text_message/image_path/audio_path)
  *
- * "Snapshot vazio" = texto em branco E sem image/audio -> ignora e cai para próximos.
- * Isso evita que um snapshot obsoleto com conteúdo vazio "vença" do template.
+ * Regras:
+ * - Snapshot válido NÃO herda mídia global.
+ * - Template inexistente é ignorado (e logado).
  */
 async function resolveEffectiveMessage(groupId) {
-  const settings = store.getSettings();
-  const preset =
-    (typeof store.getGroupPreset === 'function' && store.getGroupPreset(groupId)) ||
-    (typeof store.getAllGroupPresets === 'function' &&
-      (store.getAllGroupPresets() || []).find((p) => p.group_id === groupId)) ||
-    null;
+  const settings = store.getSettings(); // tem random_mode / global_template_id / text_message / image_path / audio_path
+  const preset = store.getGroupPreset(groupId) || null;
 
+  // 1) PRESET
   if (preset) {
     const msgs = Array.isArray(preset.messages) ? preset.messages : [];
-    const idx = Number.isFinite(preset.rotate_index) ? Number(preset.rotate_index) : 0;
+    const rIdx = Number.isFinite(preset.rotate_index) ? Number(preset.rotate_index) : 0;
 
-    let msg = null;
+    // 1.1) Snapshot
     if (msgs.length > 0) {
-      // escolhe a mensagem respeitando rotate_index
-      const cand = msgs[(idx % msgs.length + msgs.length) % msgs.length] || null;
-      // se a escolhida for "vazia", tratamos como inexistente para cair no template
+      const safeIndex = ((rIdx % msgs.length) + msgs.length) % msgs.length;
+      const cand = msgs[safeIndex] || null;
       if (cand && !isEmptySnapshotMessage(cand)) {
-        msg = cand;
-      }
-    }
-
-    if (msg) {
-      return {
-        text: textOf(msg.text),
-        image_path: cleanMediaPath(msg.image_path),
-        audio_path: cleanMediaPath(msg.audio_path),
-        threshold: preset.threshold ?? settings.threshold ?? 10,
-      };
-    }
-
-    // Fallback: template_id (se houver e válido)
-    if (preset.template_id) {
-      const tpl = store.getTemplate(preset.template_id);
-      if (tpl) {
-        const txt = textOf(tpl.text);
-        const img = cleanMediaPath(tpl.image_path);
-        const aud = cleanMediaPath(tpl.audio_path);
+        // Próximo índice (persistimos depois do envio OK)
+        const nextIdx = (safeIndex + 1) % msgs.length;
         return {
-          text: txt,
-          image_path: img,
-          audio_path: aud,
+          text: textOf(cand.text),
+          image_path: cleanMediaPath(cand.image_path),
+          audio_path: cleanMediaPath(cand.audio_path),
+          video_path: cleanMediaPath(cand.video_path), // <- vídeo no snapshot
           threshold: preset.threshold ?? settings.threshold ?? 10,
+          _meta: { source: 'preset:snapshot', nextRotateIndex: nextIdx }
         };
       }
     }
 
-    // Fallback final: global
-    return {
-      text: textOf(settings.text_message),
-      image_path: cleanMediaPath(settings.image_path),
-      audio_path: cleanMediaPath(settings.audio_path),
-      threshold: preset.threshold ?? settings.threshold ?? 10,
-    };
+    // 1.2) Template do grupo
+    if (preset.template_id != null) {
+      if (store.templateExists(preset.template_id)) {
+        const tpl = store.getTemplate(preset.template_id);
+        const txt = textOf(tpl?.text);
+        const img = cleanMediaPath(tpl?.image_path);
+        const aud = cleanMediaPath(tpl?.audio_path);
+        const vid = cleanMediaPath(tpl?.video_path); // <- vídeo no template
+        if (txt || img || aud || vid) {
+          return {
+            text: txt,
+            image_path: img,
+            audio_path: aud,
+            video_path: vid,
+            threshold: preset.threshold ?? settings.threshold ?? 10,
+            _meta: { source: `preset:template#${preset.template_id}` }
+          };
+        }
+      } else {
+        console.warn(`[resolve] template_id órfão no preset de ${groupId}: ${preset.template_id}`);
+      }
+    }
   }
 
-  // Sem preset -> usa global
+  // 2) GLOBAL
+  // 2.1) Template global fixo
+  if (settings.global_template_id != null && store.templateExists(settings.global_template_id)) {
+    const tpl = store.getTemplate(settings.global_template_id);
+    const txt = textOf(tpl?.text);
+    const img = cleanMediaPath(tpl?.image_path);
+    const aud = cleanMediaPath(tpl?.audio_path);
+    const vid = cleanMediaPath(tpl?.video_path);
+    if (txt || img || aud || vid) {
+      return {
+        text: txt,
+        image_path: img,
+        audio_path: aud,
+        video_path: vid,
+        threshold: settings.threshold ?? 10,
+        _meta: { source: `global:template#${settings.global_template_id}` }
+      };
+    }
+  }
+
+  // 2.2) Randômico (catálogo de templates)
+  if (settings.random_mode) {
+    const rtpl = store.pickRandomTemplate(); // só retorna template com conteúdo válido
+    if (rtpl) {
+      return {
+        text: textOf(rtpl.text),
+        image_path: cleanMediaPath(rtpl.image_path),
+        audio_path: cleanMediaPath(rtpl.audio_path),
+        video_path: cleanMediaPath(rtpl.video_path),
+        threshold: settings.threshold ?? 10,
+        _meta: { source: `global:random#${rtpl.id}` }
+      };
+    }
+  }
+
+  // 2.3) Texto/mídia globais (atenção: settings não tem video_path por design)
   return {
     text: textOf(settings.text_message),
     image_path: cleanMediaPath(settings.image_path),
     audio_path: cleanMediaPath(settings.audio_path),
+    video_path: null,
     threshold: settings.threshold ?? 10,
+    _meta: { source: 'global:plain' }
   };
 }
 
 /**
  * Envia a mensagem resolvida para o grupo.
- * Se não houver texto e nem mídias, não envia nada (log informativo).
+ * - Marca last_sent no início para respeitar cooldown mesmo sob corrida (inFlight protege duplicatas).
+ * - Se for snapshot, avança rotate_index após envio OK.
+ * - Se não houver texto nem mídia, apenas loga e não reseta contador.
+ * - Para vídeos, aplica limite de tamanho (default 16MB; ajuste via WPP_VIDEO_MAX_MB).
  */
 async function sendPresetToGroup(groupId) {
   if (!client) return;
@@ -189,30 +250,68 @@ async function sendPresetToGroup(groupId) {
   try {
     const msg = await resolveEffectiveMessage(groupId);
 
-    const files = [];
-    if (msg.image_path) files.push(msg.image_path);
-    if (msg.audio_path) files.push(msg.audio_path);
+    // Monta a lista de mídias a enviar (ordem: vídeo, imagem, áudio — caption só no primeiro envio)
+    const mediaList = [];
+    if (msg.video_path) mediaList.push({ path: msg.video_path });
+    if (msg.image_path) mediaList.push({ path: msg.image_path });
+    if (msg.audio_path) mediaList.push({ path: msg.audio_path });
 
     const text = textOf(msg.text);
 
-    if (files.length === 0) {
-      if (text) {
-        await client.sendText(groupId, text);
-      } else {
-        console.log('[sendPresetToGroup] Nada a enviar (texto e mídias vazios).', groupId);
-      }
+    // Se nada a enviar (nem texto nem mídia válida)
+    const hasAnyMedia = mediaList.some(m => m.path && fs.existsSync(m.path));
+    if (!text && !hasAnyMedia) {
+      console.log('[sendPresetToGroup] Nada a enviar (texto e mídias vazios).', groupId, msg?._meta);
+      return;
+    }
+
+    // marca last_sent já para segurar cooldown em caso de rajada
+    store.setLastSent(groupId, nowISO());
+
+    if (!hasAnyMedia) {
+      // só texto
+      await client.sendText(groupId, text);
     } else {
-      for (let i = 0; i < files.length; i++) {
-        const filePath = files[i];
-        if (!fs.existsSync(filePath)) continue;
+      // envia mídias (caption só na primeira)
+      let usedCaption = false;
+      for (const item of mediaList) {
+        const filePath = item.path;
+        if (!filePath || !fs.existsSync(filePath)) continue;
+
         const filename = safeBasename(filePath);
         const mimeType = mime.lookup(filename) || 'application/octet-stream';
-        const caption = i === 0 ? text : undefined;
+
+        // Checagem de tamanho para vídeo
+        if (isVideoMime(mimeType) && fileTooLarge(filePath, mimeType)) {
+          console.warn(
+            `[sendPresetToGroup] Vídeo acima do limite (${MAX_VIDEO_MB}MB). Pulado: ${filename}`
+          );
+          continue;
+        }
+
+        const caption = !usedCaption ? text : undefined;
         await client.sendFile(groupId, filePath, filename, caption, mimeType);
+        usedCaption = true;
+      }
+
+      // Se todas as mídias foram ignoradas por tamanho e não havia texto, nada foi enviado
+      if (!usedCaption && !text) {
+        console.log('[sendPresetToGroup] Todas as mídias foram ignoradas ou inexistentes e não havia texto.');
+        return;
+      }
+
+      // Se mídias foram puladas mas ainda havia texto e não foi usado como caption (nenhuma mídia enviada), envia texto
+      if (!usedCaption && text) {
+        await client.sendText(groupId, text);
       }
     }
 
-    store.setLastSent(groupId);
+    // snapshot: avança rotate_index se necessário
+    if (msg?._meta?.source === 'preset:snapshot' && Number.isFinite(msg?._meta?.nextRotateIndex)) {
+      store.bumpPresetRotateIndex(groupId, msg._meta.nextRotateIndex);
+    }
+
+    // zera contador e emite atualização
     store.reset(groupId);
     io.emit('counter:update', store.getCounter(groupId));
   } catch (err) {
@@ -261,7 +360,7 @@ async function onIncomingMessage(msg) {
     const global = store.getSettings();
 
     const enabled =
-      grpCfg && grpCfg.enabled !== undefined ? grpCfg.enabled : global.enabled;
+      (grpCfg && grpCfg.enabled !== undefined) ? grpCfg.enabled : global.enabled;
     if (!enabled) return;
 
     const th = Number(grpCfg?.threshold ?? global.threshold ?? 10);
@@ -273,6 +372,7 @@ async function onIncomingMessage(msg) {
       if (last) {
         const diffSec = (Date.now() - last.getTime()) / 1000;
         if (diffSec < cdSec) {
+          // console.log(`[cooldown] ${groupId} faltam ${(cdSec - diffSec).toFixed(1)}s`);
           return; // em cooldown
         }
       }
@@ -324,13 +424,11 @@ async function createSession(ioInstance) {
 
       qrCacheBase64 = raw || null;
 
-      // status auxiliar opcional
       if (!isConnected()) {
         statusCache = { status: 'QR' };
         io.emit('wpp:status', statusCache);
       }
 
-      // Emite em ambos os nomes para compatibilidade (base64 e base64Qr)
       io.emit('wpp:qr', { base64: qrCacheBase64, base64Qr: qrCacheBase64, attempts: Number(attempts) || 0 });
     },
     statusFind: (statusSession) => {
@@ -339,12 +437,8 @@ async function createSession(ioInstance) {
     },
   });
 
-  try {
-    hostWid = await client.getWid?.();
-  } catch {}
-  try {
-    hostNumber = await client.getHostNumber?.();
-  } catch {}
+  try { hostWid = await client.getWid?.(); } catch {}
+  try { hostNumber = await client.getHostNumber?.(); } catch {}
 
   client.onMessage(onIncomingMessage);
 

@@ -1,4 +1,4 @@
-// FRONTEND/src/components/GroupsPage.js — versão DB (usa template_id) com tratamento de template órfão
+// FRONTEND/src/components/GroupsPage.js — versão DB (usa template_id) + "Ativar em todos"
 import React, { useState, useEffect, useContext, useMemo } from 'react';
 import { AppContext } from '../appContext';
 
@@ -8,22 +8,22 @@ const GroupsPage = () => {
     groupPresets,
     loadGroups,
     saveGroupPreset,
-    templates,           // << templates vindos do DB
+    templates,
+    bulkActivateAll,   // NOVO
   } = useContext(AppContext);
 
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedGroup, setSelectedGroup] = useState(null);
   const [showConfigModal, setShowConfigModal] = useState(false);
+  const [showBulkModal, setShowBulkModal] = useState(false); // NOVO
   const [loading, setLoading] = useState(true);
 
-  // Mapa id -> template (para acesso rápido)
   const templatesById = useMemo(() => {
     const map = {};
     (templates || []).forEach((t) => { if (t?.id != null) map[t.id] = t; });
     return map;
   }, [templates]);
 
-  // Dispara só UMA vez ao montar
   useEffect(() => {
     (async () => {
       setLoading(true);
@@ -34,7 +34,6 @@ const GroupsPage = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Retry leve caso o primeiro GET venha vazio (enquanto não chega o groups:refresh)
   useEffect(() => {
     console.debug('[front] GroupsPage groups changed ->', Array.isArray(groups) ? groups.length : 'invalid');
     if (Array.isArray(groups) && groups.length === 0) {
@@ -69,7 +68,6 @@ const GroupsPage = () => {
       threshold: config.threshold,
       cooldown_sec: config.cooldown_sec ?? null,
       template_id: config.template_id ?? null,
-      // messages snapshot: deixe vazio para usar sempre o template atual do DB
     });
     setShowConfigModal(false);
     setSelectedGroup(null);
@@ -94,17 +92,28 @@ const GroupsPage = () => {
           <h3 className="text-2xl font-bold text-gray-800 dark:text-white mb-2">Gerenciar Grupos</h3>
           <p className="text-gray-600 dark:text-gray-300">Configure a automação de mensagens para seus grupos</p>
         </div>
-        <button
-          onClick={async () => {
-            setLoading(true);
-            const gs = await loadGroups();
-            setLoading(false);
-            console.debug('[front] GroupsPage manual refresh -> length=', gs?.length);
-          }}
-          className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-purple-700 transition-colors"
-        >
-          Atualizar grupos
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={async () => {
+              setLoading(true);
+              const gs = await loadGroups();
+              setLoading(false);
+              console.debug('[front] GroupsPage manual refresh -> length=', gs?.length);
+            }}
+            className="px-4 py-2 bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white rounded-lg hover:opacity-90 transition-colors"
+          >
+            Atualizar grupos
+          </button>
+
+          {/* NOVO: Ativar em todos */}
+          <button
+            onClick={() => setShowBulkModal(true)}
+            className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-purple-700 transition-colors"
+            title="Ativar automação em todos os grupos"
+          >
+            Ativar em todos
+          </button>
+        </div>
       </div>
 
       {/* Busca */}
@@ -139,10 +148,6 @@ const GroupsPage = () => {
             const enabled = !!preset?.enabled;
             const threshold = preset?.threshold ?? 10;
 
-            // Nome a exibir:
-            // 1) se tiver template_id -> nome do template
-            // 2) se tiver snapshot em messages -> "Snapshot personalizado"
-            // 3) senão -> "—"
             let displayName = '—';
             if (preset?.template_id && templatesById[preset.template_id]) {
               displayName = templatesById[preset.template_id].name || `Template #${preset.template_id}`;
@@ -179,9 +184,7 @@ const GroupsPage = () => {
                       {enabled && (
                         <>
                           <span className="text-gray-400">•</span>
-                          <span className="text-gray-600 dark:text-gray-300">
-                            {displayName}
-                          </span>
+                          <span className="text-gray-600 dark:text-gray-300">{displayName}</span>
                           <span className="text-gray-400">•</span>
                           <span className="text-gray-600 dark:text-gray-300">Após {threshold} mensagens</span>
                         </>
@@ -202,7 +205,7 @@ const GroupsPage = () => {
         )}
       </div>
 
-      {/* Modal */}
+      {/* Modal por grupo (já existente) */}
       {showConfigModal && selectedGroup && (
         <ConfigurationModal
           group={selectedGroup}
@@ -210,6 +213,18 @@ const GroupsPage = () => {
           onClose={() => {
             setShowConfigModal(false);
             setSelectedGroup(null);
+          }}
+        />
+      )}
+
+      {/* NOVO: Modal bulk */}
+      {showBulkModal && (
+        <BulkActivateModal
+          templates={templates}
+          onClose={() => setShowBulkModal(false)}
+          onApply={async (payload) => {
+            await bulkActivateAll(payload);
+            setShowBulkModal(false);
           }}
         />
       )}
@@ -221,8 +236,6 @@ const ConfigurationModal = ({ group, onSave, onClose }) => {
   const { groupPresets, templates } = useContext(AppContext);
 
   const hasTemplates = Array.isArray(templates) && templates.length > 0;
-
-  // Mapa local para checagens rápidas dentro do modal
   const templatesById = useMemo(() => {
     const map = {};
     (templates || []).forEach((t) => { if (t?.id != null) map[t.id] = t; });
@@ -231,9 +244,6 @@ const ConfigurationModal = ({ group, onSave, onClose }) => {
 
   const preset = groupPresets[group.id] || { enabled: false, threshold: 10, template_id: null };
 
-  // Escolhe o template inicial:
-  // - Se preset.template_id existir e estiver presente no DB, usa-o
-  // - Senão, usa o primeiro template disponível (ou null se não houver)
   const initialTemplateId = useMemo(() => {
     const id = preset?.template_id ?? null;
     if (id != null && templatesById[id]) return id;
@@ -247,21 +257,15 @@ const ConfigurationModal = ({ group, onSave, onClose }) => {
     template_id: initialTemplateId,
   });
 
-  // Se os templates mudarem ou o preset trocar e o template_id ficar órfão,
-  // corrigimos automaticamente para o primeiro válido.
   useEffect(() => {
-    if (!config.enabled) return; // só importa quando está habilitado
+    if (!config.enabled) return;
     if (config.template_id == null && hasTemplates) {
       setConfig((c) => ({ ...c, template_id: templates[0].id }));
       return;
     }
     if (config.template_id != null && !templatesById[config.template_id]) {
-      // órfão -> escolhe o primeiro template válido
-      if (hasTemplates) {
-        setConfig((c) => ({ ...c, template_id: templates[0].id }));
-      } else {
-        setConfig((c) => ({ ...c, template_id: null }));
-      }
+      if (hasTemplates) setConfig((c) => ({ ...c, template_id: templates[0].id }));
+      else setConfig((c) => ({ ...c, template_id: null }));
     }
   }, [hasTemplates, templates, templatesById, config.enabled, config.template_id]);
 
@@ -299,7 +303,6 @@ const ConfigurationModal = ({ group, onSave, onClose }) => {
                 <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
                   Template a enviar
                 </label>
-
                 {!hasTemplates ? (
                   <p className="text-sm text-amber-600">
                     Você ainda não tem templates. Crie em <b>Mensagens</b> antes de configurar um grupo.
@@ -372,6 +375,144 @@ const ConfigurationModal = ({ group, onSave, onClose }) => {
             disabled={config.enabled && !hasTemplates}
           >
             Salvar
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// NOVO: Modal de ativação em todos
+const BulkActivateModal = ({ templates, onApply, onClose }) => {
+  const hasTemplates = Array.isArray(templates) && templates.length > 0;
+
+  const [mode, setMode] = useState('fixed'); // 'fixed' | 'random'
+  const [templateId, setTemplateId] = useState(hasTemplates ? templates[0].id : null);
+  const [enable, setEnable] = useState(true);
+  const [threshold, setThreshold] = useState(10);
+  const [cooldown, setCooldown] = useState(0);
+
+  const canSubmit = useMemo(() => {
+    if (!enable) return true;
+    if (mode === 'fixed') return hasTemplates && templateId != null;
+    return true;
+  }, [enable, mode, hasTemplates, templateId]);
+
+  return (
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+      <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-lg p-6">
+        <div className="flex items-center justify-between mb-6">
+          <h3 className="text-xl font-semibold text-gray-800 dark:text-white">Ativar em todos os grupos</h3>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">✕</button>
+        </div>
+
+        <div className="space-y-4">
+          <label className="flex items-center gap-3">
+            <input
+              type="checkbox"
+              checked={enable}
+              onChange={(e) => setEnable(e.target.checked)}
+              className="w-4 h-4"
+            />
+            <span className="text-sm text-gray-700 dark:text-gray-300">Ativar automação em todos</span>
+          </label>
+
+          {enable && (
+            <>
+              <div className="flex items-center gap-4">
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    name="mode"
+                    value="fixed"
+                    checked={mode === 'fixed'}
+                    onChange={() => setMode('fixed')}
+                  />
+                  <span className="text-sm text-gray-700 dark:text-gray-300">Usar 1 template fixo</span>
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="radio"
+                    name="mode"
+                    value="random"
+                    checked={mode === 'random'}
+                    onChange={() => setMode('random')}
+                  />
+                  <span className="text-sm text-gray-700 dark:text-gray-300">Modo randômico (aleatório entre templates)</span>
+                </label>
+              </div>
+
+              {mode === 'fixed' && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                    Template
+                  </label>
+                  {!hasTemplates ? (
+                    <p className="text-sm text-amber-600">Crie ao menos 1 template na aba <b>Mensagens</b>.</p>
+                  ) : (
+                    <select
+                      value={templateId ?? ''}
+                      onChange={(e) => setTemplateId(e.target.value ? Number(e.target.value) : null)}
+                      className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                    >
+                      {templates.map((t) => (
+                        <option key={t.id} value={t.id}>
+                          {t.name || `Template #${t.id}`}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </div>
+              )}
+
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                    Threshold (mensagens)
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="100"
+                    value={threshold}
+                    onChange={(e) => setThreshold(parseInt(e.target.value || '1', 10))}
+                    className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                    Cooldown (segundos)
+                  </label>
+                  <input
+                    type="number"
+                    min="0"
+                    max="86400"
+                    value={cooldown}
+                    onChange={(e) => setCooldown(Math.max(0, parseInt(e.target.value || '0', 10)))}
+                    className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                  />
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+
+        <div className="flex justify-end gap-3 mt-6">
+          <button onClick={onClose} className="px-4 py-2 text-gray-700 dark:text-gray-300 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700">
+            Cancelar
+          </button>
+          <button
+            onClick={() => onApply({
+              enable,
+              mode,
+              template_id: mode === 'fixed' ? templateId : null,
+              threshold,
+              cooldown_sec: cooldown
+            })}
+            className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-purple-700 disabled:opacity-60"
+            disabled={!canSubmit}
+          >
+            Aplicar
           </button>
         </div>
       </div>

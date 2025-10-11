@@ -1,8 +1,9 @@
-// FRONTEND/src/components/MessagesPage.js — versão DB (com fix de corrida no "remover")
+// FRONTEND/src/components/MessagesPage.js — versão DB (com suporte a vídeo .mp4)
 import React, { useState, useContext, useEffect, useMemo } from 'react';
 import { AppContext } from '../appContext';
 
 const MAX_TEMPLATES = 5;
+const MAX_BYTES = 16 * 1024 * 1024;
 
 const MessagesPage = () => {
   const {
@@ -26,6 +27,7 @@ const MessagesPage = () => {
       text: t.text || '',
       image_path: t.image_path ?? null,
       audio_path: t.audio_path ?? null,
+      video_path: t.video_path ?? null,              // <<< NOVO
       created_at: t.created_at || null,
       updated_at: t.updated_at || null,
       _isNew: false,
@@ -46,6 +48,7 @@ const MessagesPage = () => {
         text: '',
         image_path: null,
         audio_path: null,
+        video_path: null,                              // <<< NOVO
         created_at: null,
         updated_at: null,
         _isNew: true,
@@ -82,10 +85,10 @@ const MessagesPage = () => {
     // monta o snapshot que será enviado AGORA
     const draft = {
       ...itemFromState,
-      ...overridePatch, // <- força o valor mais recente (ex.: image_path: null)
+      ...overridePatch, // <- força o valor mais recente (ex.: image_path: null, video_path: null)
     };
 
-    // valida antes de bater no servidor
+    // valida
     const errs = validate(draft);
     if (Object.keys(errs).length) {
       setLocal((prev) => {
@@ -106,17 +109,19 @@ const MessagesPage = () => {
           text: String(draft.text).trim(),
           image_path: draft.image_path ?? null,
           audio_path: draft.audio_path ?? null,
+          video_path: draft.video_path ?? null,        // <<< NOVO
         });
         if (created?.id) {
           await loadTemplates(); // recarrega para alinhar datas/ids
         }
       } else {
-        // atualizar no DB — envia SEMPRE image_path/audio_path (mesmo null) para sobrescrever
+        // atualizar no DB — envia SEMPRE image/audio/video (mesmo null) para sobrescrever
         await updateTemplate(draft.id, {
           name: String(draft.name).trim(),
           text: String(draft.text).trim(),
           image_path: draft.image_path ?? null,
           audio_path: draft.audio_path ?? null,
+          video_path: draft.video_path ?? null,        // <<< NOVO
         });
 
         // reflete no estado local imediatamente (sem esperar novo load)
@@ -149,7 +154,8 @@ const MessagesPage = () => {
         <div>
           <h3 className="text-2xl font-bold text-gray-800 dark:text-white mb-2">Mensagens</h3>
           <p className="text-gray-600 dark:text-gray-300">
-            Gerencie seus <b>templates</b> persistidos no servidor. Cada template pode ter anexos próprios (imagem/áudio).
+            Gerencie seus <b>templates</b> persistidos no servidor. Cada template pode ter anexos próprios
+            (<b>imagem</b>/<b>áudio</b>/<b>vídeo</b>).
           </p>
         </div>
 
@@ -240,12 +246,31 @@ const MessageCard = ({ idx, message, onChange, onSave, onDelete, uploadCatalogMe
     return Object.keys(e).length === 0;
   };
 
-  const handleUpload = async (file, kind) => {
-    if (!file) return;
-    const allowed = ['image/jpeg','image/png','image/gif','audio/mpeg','audio/wav','audio/aac','audio/ogg'];
-    const maxSize = 16 * 1024 * 1024;
-    if (!allowed.includes(file.type)) { setErrors((p) => ({ ...p, media: 'Tipo de arquivo não suportado' })); return; }
-    if (file.size > maxSize) { setErrors((p) => ({ ...p, media: 'O arquivo deve ter no máximo 16MB' })); return; }
+  const acceptAndKindFromFile = (file) => {
+    if (!file) return { kind: null, ok: false, reason: 'Arquivo ausente.' };
+    // Permitimos image/*, audio/* e video/mp4 (limite 16MB)
+    const t = String(file.type || '').toLowerCase();
+    const isImage = t.startsWith('image/');
+    const isAudio = t.startsWith('audio/');
+    const isVideo = t.startsWith('video/');
+    if (!isImage && !isAudio && !isVideo) {
+      return { kind: null, ok: false, reason: 'Tipo de arquivo não suportado.' };
+    }
+    if (isVideo && t !== 'video/mp4') {
+      return { kind: null, ok: false, reason: 'Apenas vídeo .mp4 é suportado.' };
+    }
+    if (file.size > MAX_BYTES) {
+      return { kind: null, ok: false, reason: 'O arquivo deve ter no máximo 16MB.' };
+    }
+    return { kind: isImage ? 'image' : isAudio ? 'audio' : 'video', ok: true };
+  };
+
+  const handleUpload = async (file) => {
+    const check = acceptAndKindFromFile(file);
+    if (!check.ok) {
+      setErrors((p) => ({ ...p, media: check.reason }));
+      return;
+    }
 
     const res = await uploadCatalogMedia(file);
     if (!res?.ok || !res?.path) {
@@ -253,9 +278,17 @@ const MessageCard = ({ idx, message, onChange, onSave, onDelete, uploadCatalogMe
       return;
     }
 
-    // Atualiza UI e salva IMEDIATAMENTE com override para evitar corrida
-    onChange(idx, kind === 'image' ? 'image_path' : 'audio_path', res.path);
-    await onSave({ [kind === 'image' ? 'image_path' : 'audio_path']: res.path });
+    // Atualiza UI e salva IMEDIATAMENTE com override correto
+    if (check.kind === 'image') {
+      onChange(idx, 'image_path', res.path);
+      await onSave({ image_path: res.path });
+    } else if (check.kind === 'audio') {
+      onChange(idx, 'audio_path', res.path);
+      await onSave({ audio_path: res.path });
+    } else if (check.kind === 'video') {
+      onChange(idx, 'video_path', res.path);
+      await onSave({ video_path: res.path }); // <<< NOVO
+    }
 
     setErrors((p) => ({ ...p, media: null }));
   };
@@ -269,17 +302,23 @@ const MessageCard = ({ idx, message, onChange, onSave, onDelete, uploadCatalogMe
     try { return String(p).split(/[\\/]/).pop(); } catch { return String(p || ''); }
   };
 
+  const hasAnyMedia = !!(message?.image_path || message?.audio_path || message?.video_path);
+
   return (
     <div className="bg-white dark:bg-gray-800 rounded-lg shadow-md p-6 hover:shadow-lg transition-shadow duration-200">
       <div className="flex items-start justify-between">
         <div className="flex-1">
-          <div className="flex items-center space-x-3 mb-3">
+          <div className="flex items-center space-x-3 mb-2">
             <div className="w-10 h-10 bg-primary rounded-full flex items-center justify-center">
               <span className="text-white font-semibold">{idx + 1}</span>
             </div>
             <div>
-              <h4 className="text-lg font-semibold text-gray-800 dark:text-white">
+              <h4 className="text-lg font-semibold text-gray-800 dark:text-white flex items-center gap-2">
                 {message?.name || `Template ${idx + 1}`}
+                {/* Indicadores de mídia */}
+                {message?.image_path && <span title="Possui imagem">🖼</span>}
+                {message?.audio_path && <span title="Possui áudio">🎵</span>}
+                {message?.video_path && <span title="Possui vídeo">🎬</span>}
               </h4>
               <p className="text-sm text-gray-500 dark:text-gray-400">
                 {message?.updated_at
@@ -301,12 +340,12 @@ const MessageCard = ({ idx, message, onChange, onSave, onDelete, uploadCatalogMe
               value={message?.name || ''}
               onChange={(e) => onChange(idx, 'name', e.target.value)}
               className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent bg-white dark:bg-gray-700 text-gray-900 dark:text-white ${
-                errors.name ? 'border-red-500' : 'border-gray-300 dark:border-gray-600'
+                (message?._errors?.name || errors.name) ? 'border-red-500' : 'border-gray-300 dark:border-gray-600'
               }`}
               placeholder="Ex: Mensagem de Boas-Vindas"
               maxLength={50}
             />
-            {errors.name && <p className="text-red-500 text-sm mt-1">{errors.name}</p>}
+            {(message?._errors?.name || errors.name) && <p className="text-red-500 text-sm mt-1">{message?._errors?.name || errors.name}</p>}
             <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">{(message?.name || '').length}/50 caracteres</p>
           </div>
 
@@ -320,72 +359,103 @@ const MessageCard = ({ idx, message, onChange, onSave, onDelete, uploadCatalogMe
               onChange={(e) => onChange(idx, 'text', e.target.value)}
               rows={4}
               className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent bg-white dark:bg-gray-700 text-gray-900 dark:text-white ${
-                errors.text ? 'border-red-500' : 'border-gray-300 dark:border-gray-600'
+                (message?._errors?.text || errors.text) ? 'border-red-500' : 'border-gray-300 dark:border-gray-600'
               }`}
               placeholder="Digite o texto da sua mensagem aqui..."
               maxLength={2000}
             />
-            {errors.text && <p className="text-red-500 text-sm mt-1">{errors.text}</p>}
+            {(message?._errors?.text || errors.text) && <p className="text-red-500 text-sm mt-1">{message?._errors?.text || errors.text}</p>}
             <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">{(message?.text || '').length}/2000 caracteres</p>
           </div>
 
-          {/* Imagem (opcional) */}
-          <div className="mb-3">
-            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Imagem (opcional)</label>
-            <input
-              type="file"
-              accept="image/*"
-              onChange={(e) => handleUpload(e.target.files?.[0], 'image')}
-              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
-              disabled={saving}
-            />
-            {message?.image_path && (
-              <div className="mt-2 p-2 bg-green-50 dark:bg-green-900/20 rounded-lg flex items-center justify-between">
-                <p className="text-sm text-green-700 dark:text-green-400">🖼 {basename(message.image_path)}</p>
-                <button
-                  onClick={async () => {
-                    // Atualiza UI e salva IMEDIATAMENTE com override image_path=null (evita corrida)
-                    onChange(idx, 'image_path', null);
-                    await onSave({ image_path: null });
-                  }}
-                  className="text-red-600 hover:underline text-sm"
-                  disabled={saving}
-                >
-                  remover
-                </button>
-              </div>
-            )}
-          </div>
+          {/* Linha de anexos */}
+          <div className={`mb-3 ${hasAnyMedia ? '' : 'opacity-90'}`}>
+            <p className="text-sm text-gray-600 dark:text-gray-300 mb-2">Anexos (opcional)</p>
 
-          {/* Áudio (opcional) */}
-          <div className="mb-3">
-            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Áudio (opcional)</label>
-            <input
-              type="file"
-              accept="audio/*"
-              onChange={(e) => handleUpload(e.target.files?.[0], 'audio')}
-              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
-              disabled={saving}
-            />
-            {message?.audio_path && (
-              <div className="mt-2 p-2 bg-green-50 dark:bg-green-900/20 rounded-lg flex items-center justify-between">
-                <p className="text-sm text-green-700 dark:text-green-400">🎵 {basename(message.audio_path)}</p>
-                <button
-                  onClick={async () => {
-                    onChange(idx, 'audio_path', null);
-                    await onSave({ audio_path: null });
-                  }}
-                  className="text-red-600 hover:underline text-sm"
-                  disabled={saving}
-                >
-                  remover
-                </button>
-              </div>
-            )}
-          </div>
+            {/* Imagem */}
+            <div className="mb-2">
+              <label className="block text-sm text-gray-700 dark:text-gray-300 mb-1">Imagem</label>
+              <input
+                type="file"
+                accept="image/*"
+                onChange={(e) => handleUpload(e.target.files?.[0])}
+                className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                disabled={saving}
+              />
+              {message?.image_path && (
+                <div className="mt-2 p-2 bg-green-50 dark:bg-green-900/20 rounded-lg flex items-center justify-between">
+                  <p className="text-sm text-green-700 dark:text-green-400">🖼 {basename(message.image_path)}</p>
+                  <button
+                    onClick={async () => {
+                      onChange(idx, 'image_path', null);
+                      await onSave({ image_path: null });
+                    }}
+                    className="text-red-600 hover:underline text-sm"
+                    disabled={saving}
+                  >
+                    remover
+                  </button>
+                </div>
+              )}
+            </div>
 
-          {/* erros gerais de mídia */}
-          {errors.media && <p role="alert" className="text-red-500 text-sm mt-1">{errors.media}</p>}
+            {/* Áudio */}
+            <div className="mb-2">
+              <label className="block text-sm text-gray-700 dark:text-gray-300 mb-1">Áudio</label>
+              <input
+                type="file"
+                accept="audio/*"
+                onChange={(e) => handleUpload(e.target.files?.[0])}
+                className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                disabled={saving}
+              />
+              {message?.audio_path && (
+                <div className="mt-2 p-2 bg-green-50 dark:bg-green-900/20 rounded-lg flex items-center justify-between">
+                  <p className="text-sm text-green-700 dark:text-green-400">🎵 {basename(message.audio_path)}</p>
+                  <button
+                    onClick={async () => {
+                      onChange(idx, 'audio_path', null);
+                      await onSave({ audio_path: null });
+                    }}
+                    className="text-red-600 hover:underline text-sm"
+                    disabled={saving}
+                  >
+                    remover
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Vídeo (mp4) */}
+            <div className="mb-2">
+              <label className="block text-sm text-gray-700 dark:text-gray-300 mb-1">Vídeo (.mp4)</label>
+              <input
+                type="file"
+                accept="video/mp4"
+                onChange={(e) => handleUpload(e.target.files?.[0])}
+                className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                disabled={saving}
+              />
+              {message?.video_path && (
+                <div className="mt-2 p-2 bg-green-50 dark:bg-green-900/20 rounded-lg flex items-center justify-between">
+                  <p className="text-sm text-green-700 dark:text-green-400">🎬 {basename(message.video_path)} <span className="opacity-60">(até 16MB)</span></p>
+                  <button
+                    onClick={async () => {
+                      onChange(idx, 'video_path', null);
+                      await onSave({ video_path: null });
+                    }}
+                    className="text-red-600 hover:underline text-sm"
+                    disabled={saving}
+                  >
+                    remover
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* erros gerais de mídia */}
+            {errors.media && <p role="alert" className="text-red-500 text-sm mt-1">{errors.media}</p>}
+          </div>
         </div>
 
         <div className="flex flex-col gap-2 ml-4">

@@ -18,8 +18,7 @@ export const AppProvider = ({ children }) => {
   const [groupPresets, setGroupPresets] = useState({});
   const [counters, setCounters] = useState({});
 
-  // >>> catálogo de mensagens persistido no DB
-  // Cada template: { id, name, text, image_path, audio_path, created_at, updated_at }
+  // templates do DB
   const [templates, setTemplates] = useState([]);
 
   const [error, setError] = useState(null);
@@ -85,12 +84,6 @@ export const AppProvider = ({ children }) => {
     }
   }, [j]);
 
-  // 🔒 garante templates carregados sob demanda (útil antes de abrir o modal)
-  const ensureTemplatesLoaded = useCallback(async () => {
-    if (Array.isArray(templates) && templates.length > 0) return templates;
-    return await loadTemplates();
-  }, [templates, loadTemplates]);
-
   // ------- Sessão -------
   const start = useCallback(async () => {
     try {
@@ -113,18 +106,23 @@ export const AppProvider = ({ children }) => {
     }
   }, [j, loadStatus]);
 
-  // ------- Upload de mídia por TEMPLATE -------
+  // Upload de mídia por TEMPLATE (image | audio | video)
   const uploadCatalogMedia = useCallback(async (file) => {
     const fd = new FormData();
-    if (file && file.type?.startsWith('image/')) fd.append('image', file);
-    else if (file && file.type?.startsWith('audio/')) fd.append('audio', file);
-    else fd.append('image', file);
+    if (file && file.type?.startsWith('image/')) {
+      fd.append('image', file);
+    } else if (file && file.type?.startsWith('audio/')) {
+      fd.append('audio', file);
+    } else if (file && file.type?.startsWith('video/')) {
+      fd.append('video', file);
+    } else {
+      // fallback: mantém compat com fluxos antigos (tratava como imagem)
+      fd.append('image', file);
+    }
 
     try {
       const res = await fetch(`${API}/api/catalog-media`, { method: 'POST', body: fd }).then(j);
-      // res.path -> caminho absoluto no FS do servidor (usado no sendFile)
-      // res.rel  -> "uploads/<arquivo>", útil só para exibir nome
-      return res;
+      return res; // { ok, type: 'image'|'audio'|'video', path, rel }
     } catch (e) {
       console.error('[front] uploadCatalogMedia error', e);
       setError('Falha no upload de mídia.');
@@ -132,10 +130,16 @@ export const AppProvider = ({ children }) => {
     }
   }, [j]);
 
-  // ------- CRUD de Templates (DB) -------
-  const createTemplate = useCallback(async ({ name, text, image_path = null, audio_path = null }) => {
+  // CRUD Templates
+  const createTemplate = useCallback(async ({ name, text, image_path = null, audio_path = null, video_path = null }) => {
     try {
-      const body = { name: String(name || '').trim(), text: String(text || '').trim(), image_path, audio_path };
+      const body = {
+        name: String(name || '').trim(),
+        text: String(text || '').trim(),
+        image_path,
+        audio_path,
+        video_path, // <- novo campo opcional
+      };
       const res = await fetch(`${API}/api/templates`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -153,10 +157,15 @@ export const AppProvider = ({ children }) => {
 
   const updateTemplate = useCallback(async (id, patch = {}) => {
     try {
+      // Garante que video_path passe para o backend quando existir
+      const body = { ...patch };
+      if (!('video_path' in body)) {
+        // nada — manter compat. Se o caller incluir video_path, vai junto.
+      }
       const res = await fetch(`${API}/api/templates/${id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(patch)
+        body: JSON.stringify(body)
       }).then(j);
       const updated = res?.template;
       if (updated?.id) {
@@ -174,8 +183,7 @@ export const AppProvider = ({ children }) => {
     try {
       await fetch(`${API}/api/templates/${id}`, { method: 'DELETE' }).then(j);
       setTemplates((prev) => prev.filter((t) => t.id !== id));
-      // importante: presets que apontavam para esse template foram limpos no backend
-      // então atualizamos o mapa local para refletir imediatamente
+      // também recarrega presets para refletir a limpeza de template_id
       await loadGroupPresets();
       return true;
     } catch (e) {
@@ -185,27 +193,24 @@ export const AppProvider = ({ children }) => {
     }
   }, [j, loadGroupPresets]);
 
-  // ------- Preset por grupo (agora com template_id) -------
+  // Preset por grupo
   const saveGroupPreset = useCallback(
     async ({ group_id, enabled, threshold, cooldown_sec, template_id, snapshotMessage }) => {
       try {
-        // prioridade é template_id; se vier snapshotMessage, mandamos em messages (opcional)
         const payload = {
           group_id,
           enabled: !!enabled,
           threshold: (threshold != null ? Number(threshold) : undefined),
           cooldown_sec: (cooldown_sec != null ? Number(cooldown_sec) : undefined),
           template_id: (template_id != null ? Number(template_id) : null),
-          // compat: ao enviar [], limpamos qualquer snapshot antigo para usar só o template
+          // snapshotMessage pode conter { text, image_path, audio_path, video_path }
           messages: Array.isArray(snapshotMessage) ? snapshotMessage : []
         };
-
         const res = await fetch(`${API}/api/group-presets`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         }).then(j);
-
         const saved = res?.preset;
         if (saved?.group_id) {
           setGroupPresets((prev) => ({ ...prev, [saved.group_id]: saved }));
@@ -220,7 +225,31 @@ export const AppProvider = ({ children }) => {
     [j]
   );
 
-  // ------- Bootstrap + Socket -------
+  // NOVO: ativar todos em lote
+  const bulkActivateAll = useCallback(
+    async ({ enable = true, mode = 'fixed', template_id = null, threshold = undefined, cooldown_sec = undefined }) => {
+      try {
+        const body = { enable, mode, template_id, threshold, cooldown_sec };
+        const res = await fetch(`${API}/api/groups/activate-all`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        }).then(j);
+        // aplica presets retornados
+        const map = {};
+        (res?.presets || []).forEach((p) => { if (p?.group_id) map[p.group_id] = p; });
+        setGroupPresets(map);
+        return res;
+      } catch (e) {
+        console.error('[front] bulkActivateAll error', e);
+        setError('Falha ao ativar em todos os grupos.');
+        return null;
+      }
+    },
+    [j]
+  );
+
+  // Bootstrap + socket
   useEffect(() => {
     loadStatus();
     loadGroups();
@@ -231,19 +260,8 @@ export const AppProvider = ({ children }) => {
       try {
         const res = await fetch(`${API}/api/qr`);
         if (res.ok) {
-          // Agora /api/qr retorna text/plain com o base64 cru.
-          // Ainda assim, deixamos robusto para aceitar JSON legado.
-          const text = await res.text();
-          if (text && text.trim().startsWith('{')) {
-            // legado: { ok:true, base64Qr: "..." }
-            try {
-              const obj = JSON.parse(text);
-              const val = obj?.base64 || obj?.base64Qr;
-              if (val) setQrCode(String(val).trim());
-            } catch {}
-          } else if (text) {
-            setQrCode(String(text).trim());
-          }
+          const data = await res.json();
+          if (data?.base64Qr) setQrCode(data.base64Qr);
         }
       } catch {}
     })();
@@ -258,12 +276,7 @@ export const AppProvider = ({ children }) => {
     });
 
     socket.on('wpp:status', (s) => { setStatus(s || {}); setError(null); if (!s) setQrCode(null); });
-    socket.on('wpp:qr', (p) => {
-      // aceita ambos os nomes (base64 e base64Qr) para compatibilidade
-      const val = p?.base64 || p?.base64Qr || null;
-      setQrCode(val);
-      setError(null);
-    });
+    socket.on('wpp:qr', (p) => { setQrCode(p?.base64Qr || null); setError(null); });
     socket.on('counter:update', (row) => {
       if (row?.group_id) setCounters((prev) => ({ ...prev, [row.group_id]: row }));
     });
@@ -273,7 +286,6 @@ export const AppProvider = ({ children }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ------- Tema -------
   useEffect(() => {
     if (darkMode) document.documentElement.classList.add('dark');
     else document.documentElement.classList.remove('dark');
@@ -293,13 +305,14 @@ export const AppProvider = ({ children }) => {
         templates, setTemplates,
         start, disconnect,
         loadGroups, loadGroupPresets, loadTemplates,
-        ensureTemplatesLoaded,          // << novo helper
         // Templates (CRUD)
         createTemplate, updateTemplate, deleteTemplate,
         // Upload de mídia por template
         uploadCatalogMedia,
         // Preset por grupo
         saveGroupPreset,
+        // BULK
+        bulkActivateAll,
       }}
     >
       {children}
