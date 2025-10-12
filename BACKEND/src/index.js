@@ -42,7 +42,7 @@ const sanitizeSnapshotMessages = (arr) => {
     const text = trimStr(m?.text);
     const image_path = cleanPath(m?.image_path);
     const audio_path = cleanPath(m?.audio_path);
-    const video_path = cleanPath(m?.video_path); // <- suporte a vídeo no snapshot
+    const video_path = cleanPath(m?.video_path);
     if (!text && !image_path && !audio_path && !video_path) continue;
     out.push({ text, image_path, audio_path, video_path });
   }
@@ -112,50 +112,30 @@ app.get('/api/groups', async (req, res) => {
 
 // settings globais
 app.post('/api/settings', async (req, res) => {
-  const payload = pick(req.body, [
-    'enabled','threshold','text_message','send_to_all','selected_groups','random_mode','global_template_id'
-  ]);
+  const payload = pick(req.body, ['enabled','threshold','text_message','send_to_all','selected_groups','random_mode','global_template_id']);
   const updated = store.updateSettings(payload);
   res.json({ ok: true, settings: updated });
 });
 
-// ---------- MÍDIA GLOBAL ----------
-app.post(
-  '/api/media',
-  upload.fields([
-    { name: 'image', maxCount: 1 },
-    { name: 'audio', maxCount: 1 },
-    { name: 'video', maxCount: 1 }, // <- aceita vídeo opcional
-  ]),
+// mídia global
+app.post('/api/media',
+  upload.fields([{ name: 'image', maxCount: 1 }, { name: 'audio', maxCount: 1 }, { name: 'video', maxCount: 1 }]),
   (req, res) => {
     const files = req.files || {};
     const image = (files.image && files.image[0]) ? files.image[0].path : undefined;
     const audio = (files.audio && files.audio[0]) ? files.audio[0].path : undefined;
     const video = (files.video && files.video[0]) ? files.video[0].path : undefined;
-
-    // Mantém compatibilidade: store.updateSettings não precisa ter video_path no schema;
-    // se existir no store, ótimo; senão, a chave extra é simplesmente ignorada.
     const updated = store.updateSettings({ image_path: image, audio_path: audio, video_path: video });
-
-    res.json({
-      ok: true,
-      settings: updated,
-      media: {
-        image_path: image ? path.resolve(image) : null,
-        audio_path: audio ? path.resolve(audio) : null,
-        video_path: video ? path.resolve(video) : null,
-      }
-    });
+    res.json({ ok: true, settings: updated });
   }
 );
 
-// ---------- MÍDIA por TEMPLATE (Catálogo) ----------
-app.post(
-  '/api/catalog-media',
+// ---------- Mídia por TEMPLATE ----------
+app.post('/api/catalog-media',
   upload.fields([
     { name: 'image', maxCount: 1 },
     { name: 'audio', maxCount: 1 },
-    { name: 'video', maxCount: 1 }, // <- aceita vídeo
+    { name: 'video', maxCount: 1 }
   ]),
   (req, res) => {
     try {
@@ -168,7 +148,6 @@ app.post(
         return res.status(400).json({ ok: false, error: 'Envie "image", "audio" ou "video".' });
       }
 
-      // Se vier mais de um, prioriza image > audio > video (padrão antigo mantido; compatibilidade)
       const file = img || aud || vid;
       const abs = path.resolve(file.path);
       const rel = path
@@ -290,25 +269,48 @@ app.post('/api/groups/activate-all', (req, res) => {
   res.json({ ok:true, presets, settings: store.getSettings() });
 });
 
-// ---------- upload de mídia por grupo ----------
-app.post(
-  '/api/group-media/:groupId',
-  upload.fields([
-    { name: 'image', maxCount: 1 },
-    { name: 'audio', maxCount: 1 },
-    { name: 'video', maxCount: 1 }, // <- aceita vídeo por grupo
-  ]),
+// upload de mídia por grupo (se precisar)
+app.post('/api/group-media/:groupId',
+  upload.fields([{ name: 'image', maxCount: 1 }, { name: 'audio', maxCount: 1 }, { name: 'video', maxCount: 1 }]),
   (req, res) => {
     const { groupId } = req.params;
     const files = req.files || {};
     const out = {
       image_path: (files.image && files.image[0]) ? path.resolve(files.image[0].path) : undefined,
       audio_path: (files.audio && files.audio[0]) ? path.resolve(files.audio[0].path) : undefined,
-      video_path: (files.video && files.video[0]) ? path.resolve(files.video[0].path) : undefined,
+      video_path: (files.video && files.video[0]) ? path.resolve(files.video[0].path) : undefined
     };
     res.json({ ok:true, files: out, groupId });
   }
 );
+
+// ------ NOVA ROTA: reset de sessão (.wpp-data/<SESSION_NAME>) ------
+app.post('/api/session/wipe', async (req, res) => {
+  try {
+    // 1) encerra sessão atual (se houver)
+    await bot.closeSession();
+
+    // 2) calcula pasta da sessão e remove
+    const sessionName = process.env.SESSION_NAME || 'group-bot';
+    const base = path.resolve(path.join(__dirname, '..', process.env.WPP_DATA_DIR || '.wpp-data'));
+    const target = path.join(base, sessionName);
+
+    // segurança básica: só apaga se o alvo estiver dentro de base
+    if (!target.startsWith(base)) {
+      return res.status(400).json({ ok:false, error:'Alvo inválido para wipe.' });
+    }
+
+    fs.rmSync(target, { recursive: true, force: true });
+
+    // 3) atualiza status front
+    io.emit('wpp:status', { status: 'DISCONNECTED' });
+
+    return res.json({ ok: true, wiped: target });
+  } catch (e) {
+    console.error('wipe session error:', e);
+    return res.status(500).json({ ok:false, error: e.message || 'Falha ao limpar sessão' });
+  }
+});
 
 app.post('/api/test-send', async (req, res) => {
   const { groupId } = req.body || {};
@@ -342,6 +344,5 @@ app.get(/^\/(?!api\/|socket\.io\/).*/, (req, res) => {
 
 server.listen(PORT, async () => {
   console.log(`Servidor rodando em http://localhost:${PORT}`);
-  // opcional: start automático
-  // await bot.createSession(io);
+  // opcional: await bot.createSession(io);
 });

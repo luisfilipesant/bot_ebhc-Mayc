@@ -106,23 +106,32 @@ export const AppProvider = ({ children }) => {
     }
   }, [j, loadStatus]);
 
-  // Upload de mídia por TEMPLATE (image | audio | video)
+  // NOVO: reset total (apaga .wpp-data/<SESSION_NAME>)
+  const resetSession = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/api/session/wipe`, { method: 'POST' }).then(j);
+      setQrCode(null);
+      await loadStatus();
+      await loadGroups();
+      return res;
+    } catch (e) {
+      console.error('[front] resetSession error', e);
+      setError('Falha ao resetar a sessão.');
+      return null;
+    }
+  }, [j, loadStatus, loadGroups]);
+
+  // Upload de mídia por TEMPLATE
   const uploadCatalogMedia = useCallback(async (file) => {
     const fd = new FormData();
-    if (file && file.type?.startsWith('image/')) {
-      fd.append('image', file);
-    } else if (file && file.type?.startsWith('audio/')) {
-      fd.append('audio', file);
-    } else if (file && file.type?.startsWith('video/')) {
-      fd.append('video', file);
-    } else {
-      // fallback: mantém compat com fluxos antigos (tratava como imagem)
-      fd.append('image', file);
-    }
+    if (file && file.type?.startsWith('image/')) fd.append('image', file);
+    else if (file && file.type?.startsWith('audio/')) fd.append('audio', file);
+    else if (file && file.type?.startsWith('video/')) fd.append('video', file);
+    else fd.append('image', file);
 
     try {
       const res = await fetch(`${API}/api/catalog-media`, { method: 'POST', body: fd }).then(j);
-      return res; // { ok, type: 'image'|'audio'|'video', path, rel }
+      return res;
     } catch (e) {
       console.error('[front] uploadCatalogMedia error', e);
       setError('Falha no upload de mídia.');
@@ -133,13 +142,7 @@ export const AppProvider = ({ children }) => {
   // CRUD Templates
   const createTemplate = useCallback(async ({ name, text, image_path = null, audio_path = null, video_path = null }) => {
     try {
-      const body = {
-        name: String(name || '').trim(),
-        text: String(text || '').trim(),
-        image_path,
-        audio_path,
-        video_path, // <- novo campo opcional
-      };
+      const body = { name: String(name || '').trim(), text: String(text || '').trim(), image_path, audio_path, video_path };
       const res = await fetch(`${API}/api/templates`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -157,15 +160,10 @@ export const AppProvider = ({ children }) => {
 
   const updateTemplate = useCallback(async (id, patch = {}) => {
     try {
-      // Garante que video_path passe para o backend quando existir
-      const body = { ...patch };
-      if (!('video_path' in body)) {
-        // nada — manter compat. Se o caller incluir video_path, vai junto.
-      }
       const res = await fetch(`${API}/api/templates/${id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
+        body: JSON.stringify(patch)
       }).then(j);
       const updated = res?.template;
       if (updated?.id) {
@@ -203,7 +201,6 @@ export const AppProvider = ({ children }) => {
           threshold: (threshold != null ? Number(threshold) : undefined),
           cooldown_sec: (cooldown_sec != null ? Number(cooldown_sec) : undefined),
           template_id: (template_id != null ? Number(template_id) : null),
-          // snapshotMessage pode conter { text, image_path, audio_path, video_path }
           messages: Array.isArray(snapshotMessage) ? snapshotMessage : []
         };
         const res = await fetch(`${API}/api/group-presets`, {
@@ -313,6 +310,8 @@ export const AppProvider = ({ children }) => {
         saveGroupPreset,
         // BULK
         bulkActivateAll,
+        // NOVO: Reset de sessão
+        resetSession,
       }}
     >
       {children}
