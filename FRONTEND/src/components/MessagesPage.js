@@ -1,4 +1,4 @@
-// FRONTEND/src/components/MessagesPage.js — versão DB (com suporte a vídeo .mp4)
+// FRONTEND/src/components/MessagesPage.js — versão DB por sessão (com suporte a vídeo .mp4)
 import React, { useState, useContext, useEffect, useMemo } from 'react';
 import { AppContext } from '../appContext';
 
@@ -7,19 +7,29 @@ const MAX_BYTES = 16 * 1024 * 1024;
 
 const MessagesPage = () => {
   const {
-    templates,
-    createTemplate,
-    updateTemplate,
-    deleteTemplate,
-    uploadCatalogMedia,
-    loadTemplates,
+    session,                 // <- sessão atual (ex.: 'default' | 's1' | 's2' ...)
+    templates,               // lista já filtrada pela sessão no AppContext
+    createTemplate,          // chama /api/:session/templates
+    updateTemplate,          // chama /api/:session/templates/:id
+    deleteTemplate,          // chama /api/:session/templates/:id
+    uploadCatalogMedia,      // chama /api/:session/catalog-media
+    loadTemplates,           // recarrega /api/:session/templates
   } = useContext(AppContext);
 
   // estado local editável (clone dos templates do contexto)
   const [local, setLocal] = useState([]);
   const [saving, setSaving] = useState(false);
 
-  // sincroniza quando o contexto muda
+  // zera state quando a sessão muda (evita “vazamento” entre sessões)
+  useEffect(() => {
+    setLocal([]);
+    setSaving(false);
+    // força sincronização para a sessão ativa (AppContext já faz isso, mas não custa reforçar):
+    loadTemplates().catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session]);
+
+  // sincroniza quando os templates do contexto mudam
   useEffect(() => {
     const mapped = (Array.isArray(templates) ? templates : []).map((t) => ({
       id: t.id,
@@ -27,7 +37,7 @@ const MessagesPage = () => {
       text: t.text || '',
       image_path: t.image_path ?? null,
       audio_path: t.audio_path ?? null,
-      video_path: t.video_path ?? null,              // <<< NOVO
+      video_path: t.video_path ?? null,
       created_at: t.created_at || null,
       updated_at: t.updated_at || null,
       _isNew: false,
@@ -48,7 +58,7 @@ const MessagesPage = () => {
         text: '',
         image_path: null,
         audio_path: null,
-        video_path: null,                              // <<< NOVO
+        video_path: null,
         created_at: null,
         updated_at: null,
         _isNew: true,
@@ -82,13 +92,11 @@ const MessagesPage = () => {
     const itemFromState = local[idx];
     if (!itemFromState) return;
 
-    // monta o snapshot que será enviado AGORA
     const draft = {
       ...itemFromState,
-      ...overridePatch, // <- força o valor mais recente (ex.: image_path: null, video_path: null)
+      ...overridePatch,
     };
 
-    // valida
     const errs = validate(draft);
     if (Object.keys(errs).length) {
       setLocal((prev) => {
@@ -103,28 +111,26 @@ const MessagesPage = () => {
       setSaving(true);
 
       if (draft._isNew || !draft.id) {
-        // criar no DB
         const created = await createTemplate({
           name: String(draft.name).trim(),
           text: String(draft.text).trim(),
           image_path: draft.image_path ?? null,
           audio_path: draft.audio_path ?? null,
-          video_path: draft.video_path ?? null,        // <<< NOVO
+          video_path: draft.video_path ?? null,
         });
         if (created?.id) {
           await loadTemplates(); // recarrega para alinhar datas/ids
         }
       } else {
-        // atualizar no DB — envia SEMPRE image/audio/video (mesmo null) para sobrescrever
         await updateTemplate(draft.id, {
           name: String(draft.name).trim(),
           text: String(draft.text).trim(),
           image_path: draft.image_path ?? null,
           audio_path: draft.audio_path ?? null,
-          video_path: draft.video_path ?? null,        // <<< NOVO
+          video_path: draft.video_path ?? null,
         });
 
-        // reflete no estado local imediatamente (sem esperar novo load)
+        // reflete no estado local imediatamente
         setLocal((prev) => {
           const next = [...prev];
           next[idx] = { ...draft, _isNew: false, _errors: {} };
@@ -152,8 +158,11 @@ const MessagesPage = () => {
     <div>
       <div className="flex items-center justify-between mb-6">
         <div>
-          <h3 className="text-2xl font-bold text-gray-800 dark:text-white mb-2">Mensagens</h3>
+          <h3 className="text-2xl font-bold text-gray-800 dark:text-white mb-1">Mensagens</h3>
           <p className="text-gray-600 dark:text-gray-300">
+            Sessão: <span className="px-2 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-100">{String(session || 'default')}</span>
+          </p>
+          <p className="text-gray-600 dark:text-gray-300 mt-1">
             Gerencie seus <b>templates</b> persistidos no servidor. Cada template pode ter anexos próprios
             (<b>imagem</b>/<b>áudio</b>/<b>vídeo</b>).
           </p>
@@ -248,7 +257,6 @@ const MessageCard = ({ idx, message, onChange, onSave, onDelete, uploadCatalogMe
 
   const acceptAndKindFromFile = (file) => {
     if (!file) return { kind: null, ok: false, reason: 'Arquivo ausente.' };
-    // Permitimos image/*, audio/* e video/mp4 (limite 16MB)
     const t = String(file.type || '').toLowerCase();
     const isImage = t.startsWith('image/');
     const isAudio = t.startsWith('audio/');
@@ -278,7 +286,6 @@ const MessageCard = ({ idx, message, onChange, onSave, onDelete, uploadCatalogMe
       return;
     }
 
-    // Atualiza UI e salva IMEDIATAMENTE com override correto
     if (check.kind === 'image') {
       onChange(idx, 'image_path', res.path);
       await onSave({ image_path: res.path });
@@ -287,7 +294,7 @@ const MessageCard = ({ idx, message, onChange, onSave, onDelete, uploadCatalogMe
       await onSave({ audio_path: res.path });
     } else if (check.kind === 'video') {
       onChange(idx, 'video_path', res.path);
-      await onSave({ video_path: res.path }); // <<< NOVO
+      await onSave({ video_path: res.path });
     }
 
     setErrors((p) => ({ ...p, media: null }));
@@ -295,7 +302,7 @@ const MessageCard = ({ idx, message, onChange, onSave, onDelete, uploadCatalogMe
 
   const handleSaveClick = async () => {
     if (!validate()) return;
-    await onSave(); // sem override -> usa o estado atual
+    await onSave();
   };
 
   const basename = (p) => {
@@ -315,7 +322,6 @@ const MessageCard = ({ idx, message, onChange, onSave, onDelete, uploadCatalogMe
             <div>
               <h4 className="text-lg font-semibold text-gray-800 dark:text-white flex items-center gap-2">
                 {message?.name || `Template ${idx + 1}`}
-                {/* Indicadores de mídia */}
                 {message?.image_path && <span title="Possui imagem">🖼</span>}
                 {message?.audio_path && <span title="Possui áudio">🎵</span>}
                 {message?.video_path && <span title="Possui vídeo">🎬</span>}
@@ -453,7 +459,6 @@ const MessageCard = ({ idx, message, onChange, onSave, onDelete, uploadCatalogMe
               )}
             </div>
 
-            {/* erros gerais de mídia */}
             {errors.media && <p role="alert" className="text-red-500 text-sm mt-1">{errors.media}</p>}
           </div>
         </div>

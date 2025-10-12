@@ -1,47 +1,59 @@
-// FRONTEND/src/components/GroupsPage.js — versão DB (usa template_id) + "Ativar em todos"
+// FRONTEND/src/components/GroupsPage.js — versão DB + sessões (usa template_id) + "Ativar em todos"
 import React, { useState, useEffect, useContext, useMemo } from 'react';
 import { AppContext } from '../appContext';
 
 const GroupsPage = () => {
   const {
+    session,                 // <- sessão atual (ex.: 'default', 's1', 's2'...)
     groups,
     groupPresets,
     loadGroups,
     saveGroupPreset,
     templates,
-    bulkActivateAll,   // NOVO
+    bulkActivateAll,         // batch por sessão
   } = useContext(AppContext);
 
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedGroup, setSelectedGroup] = useState(null);
   const [showConfigModal, setShowConfigModal] = useState(false);
-  const [showBulkModal, setShowBulkModal] = useState(false); // NOVO
+  const [showBulkModal, setShowBulkModal] = useState(false);
   const [loading, setLoading] = useState(true);
 
+  // Map de templates por id
   const templatesById = useMemo(() => {
     const map = {};
     (templates || []).forEach((t) => { if (t?.id != null) map[t.id] = t; });
     return map;
   }, [templates]);
 
+  // Carrega grupos ao montar e quando a sessão muda
   useEffect(() => {
+    let mounted = true;
     (async () => {
       setLoading(true);
-      const gs = await loadGroups();
-      setLoading(false);
-      console.debug('[front] GroupsPage mounted -> loadGroups length=', gs?.length);
+      try {
+        await loadGroups();
+      } finally {
+        if (mounted) setLoading(false);
+      }
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
+    // ao trocar de sessão, limpa seleção e busca
+    setSelectedGroup(null);
+    setShowConfigModal(false);
+    setSearchTerm('');
+
+    return () => { mounted = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session]);
+
+  // Retry suave se vier lista vazia
   useEffect(() => {
-    console.debug('[front] GroupsPage groups changed ->', Array.isArray(groups) ? groups.length : 'invalid');
     if (Array.isArray(groups) && groups.length === 0) {
       const t = setTimeout(async () => {
         setLoading(true);
         try {
-          const gs = await loadGroups();
-          console.debug('[front] GroupsPage retry -> length=', gs?.length);
+          await loadGroups();
         } finally {
           setLoading(false);
         }
@@ -90,26 +102,29 @@ const GroupsPage = () => {
       <div className="mb-6 flex items-center justify-between">
         <div>
           <h3 className="text-2xl font-bold text-gray-800 dark:text-white mb-2">Gerenciar Grupos</h3>
-          <p className="text-gray-600 dark:text-gray-300">Configure a automação de mensagens para seus grupos</p>
+          <p className="text-gray-600 dark:text-gray-300">
+            Configure a automação de mensagens para os grupos da sessão selecionada
+          </p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex items-center gap-3">
+          <span className="text-xs px-2 py-1 rounded bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-200">
+            Sessão: <b>{String(session || 'default')}</b>
+          </span>
           <button
             onClick={async () => {
               setLoading(true);
-              const gs = await loadGroups();
-              setLoading(false);
-              console.debug('[front] GroupsPage manual refresh -> length=', gs?.length);
+              try { await loadGroups(); } finally { setLoading(false); }
             }}
             className="px-4 py-2 bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white rounded-lg hover:opacity-90 transition-colors"
           >
             Atualizar grupos
           </button>
 
-          {/* NOVO: Ativar em todos */}
+          {/* Ativar em todos (por sessão) */}
           <button
             onClick={() => setShowBulkModal(true)}
             className="px-4 py-2 bg-primary text-white rounded-lg hover:bg-purple-700 transition-colors"
-            title="Ativar automação em todos os grupos"
+            title="Ativar automação em todos os grupos desta sessão"
           >
             Ativar em todos
           </button>
@@ -139,7 +154,7 @@ const GroupsPage = () => {
               {searchTerm ? 'Nenhum grupo encontrado' : 'Nenhum grupo disponível'}
             </h4>
             <p className="text-gray-600 dark:text-gray-300">
-              {searchTerm ? 'Tente buscar com outros termos' : 'Conecte-se para ver seus grupos'}
+              {searchTerm ? 'Tente buscar com outros termos' : 'Conecte-se e atualize para ver seus grupos'}
             </p>
           </div>
         ) : (
@@ -205,7 +220,7 @@ const GroupsPage = () => {
         )}
       </div>
 
-      {/* Modal por grupo (já existente) */}
+      {/* Modal por grupo */}
       {showConfigModal && selectedGroup && (
         <ConfigurationModal
           group={selectedGroup}
@@ -217,7 +232,7 @@ const GroupsPage = () => {
         />
       )}
 
-      {/* NOVO: Modal bulk */}
+      {/* Modal de ativação em todos (por sessão) */}
       {showBulkModal && (
         <BulkActivateModal
           templates={templates}
@@ -382,7 +397,7 @@ const ConfigurationModal = ({ group, onSave, onClose }) => {
   );
 };
 
-// NOVO: Modal de ativação em todos
+// Modal de ativação em todos (por sessão)
 const BulkActivateModal = ({ templates, onApply, onClose }) => {
   const hasTemplates = Array.isArray(templates) && templates.length > 0;
 
