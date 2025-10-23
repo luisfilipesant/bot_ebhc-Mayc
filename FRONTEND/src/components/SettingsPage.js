@@ -6,8 +6,8 @@ const SettingsPage = () => {
   const {
     darkMode, setDarkMode,
     status, isConnected,
-    session,          // <- sessão atual (ex.: 'default', 's1', 's2'...)
-    resetTokens,      // <- chama POST /api/:session/reset-tokens e atualiza status
+    session,          // sessão atual (ex.: 'default', 's1', 's2'...)
+    resetSession,     // <- usa o nome correto exposto pelo contexto
     disconnect,       // opcional: encerrar antes de resetar
   } = useContext(AppContext);
 
@@ -16,7 +16,7 @@ const SettingsPage = () => {
 
   const handleToggleTheme = () => setDarkMode(!darkMode);
 
-  const handleResetTokens = async () => {
+  const handleResetSession = async () => {
     if (!window.confirm(
       `Isto vai encerrar a sessão "${session}" (se houver) e apagar os tokens/chaves locais dessa sessão. Continuar?`
     )) {
@@ -27,12 +27,12 @@ const SettingsPage = () => {
       setBusy(true);
       setFeedback(null);
 
-      // UX: se estiver conectado, encerra antes (server também fecha na rota, mas mantemos claro)
+      // UX: se estiver conectado, encerra antes (server também fecha na rota)
       if (isConnected) {
         try { await disconnect(); } catch {}
       }
 
-      const res = await resetTokens(); // usa a sessão do contexto
+      const res = await resetSession(); // <- chama a função correta do contexto
       if (res?.ok) {
         setFeedback(`Sessão "${session}" resetada com sucesso. Clique em "Conectar" para gerar um novo QR.`);
       } else {
@@ -84,7 +84,7 @@ const SettingsPage = () => {
 
         <div className="flex items-center gap-3">
           <button
-            onClick={handleResetTokens}
+            onClick={handleResetSession}
             disabled={busy}
             className="px-4 py-2 rounded-lg bg-red-600 text-white hover:bg-red-700 disabled:opacity-60"
             title="Encerrar e limpar tokens da sessão (apagar .wpp-data da sessão)"

@@ -289,7 +289,7 @@ async function sendPresetToGroup(session, groupId) {
     }
 
     s.reset(groupId);
-    if (io) io.emit('counter:update', s.getCounter(groupId));
+    if (io) io.emit('counter:update', { ...s.getCounter(groupId), session });
   } catch (err) {
     console.error(`[${session}] Erro ao enviar preset:`, err.message);
   }
@@ -335,7 +335,7 @@ async function onIncomingMessage(session, msg) {
 
     // contador
     s.increment(groupId);
-    if (io) io.emit('counter:update', s.getCounter(groupId));
+    if (io) io.emit('counter:update', { ...s.getCounter(groupId), session });
 
     // threshold (grupo > global)
     const grpCfg = s.getGroupPreset(groupId) || null;
@@ -388,7 +388,7 @@ async function createSession(session, ioInstance) {
       const groups = await ensureGroupsPersisted(session);
       if (groups.length > 0) break;
     }
-    if (io) io.emit('groups:refresh'); // frontend puxa /api/groups da sessão atual
+    // intencionalmente não emitimos groups:refresh aqui para evitar conflito de payload
   })();
 
   return client;
@@ -396,12 +396,35 @@ async function createSession(session, ioInstance) {
 
 async function closeSession(session) {
   try {
-    await sessionManager.closeSession(session);
-    // não limpamos io; múltiplas sessões compartilham
-    // counters/status/qr por sessão são atualizados pelo manager
+    await sessionManager.closeSession(session); // fecha navegador SEM logout
   } catch (e) {
     console.error(`[${session}] Erro ao encerrar sessão:`, e.message);
   }
+}
+
+/**
+ * Wipe completo desta sessão:
+ * - Fecha cliente (sem logout)
+ * - Remove a pasta de tokens .wpp-data/<session>
+ * - Emite status DISCONNECTED apenas para a sala da sessão
+ * Retorna true/false indicando se a pasta foi removida.
+ */
+async function wipeSession(session) {
+  try {
+    await sessionManager.closeSession(session);
+  } catch {}
+
+  const ok = sessionManager.cleanupSessionData(session);
+
+  try {
+    if (io?.to) {
+      io.to(session).emit('wpp:status', { session, status: 'DISCONNECTED' });
+    } else if (io?.emit) {
+      io.emit('wpp:status', { session, status: 'DISCONNECTED' });
+    }
+  } catch {}
+
+  return ok;
 }
 
 // ======= Exports =======
@@ -409,6 +432,7 @@ module.exports = {
   // ciclo de vida
   createSession,
   closeSession,
+  wipeSession,
 
   // estado
   getStatus,

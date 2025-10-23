@@ -11,11 +11,10 @@ const WPP_DATA_DIR = process.env.WPP_DATA_DIR || '.wpp-data';
 const SESSION_NAME_DEFAULT = process.env.SESSION_NAME || 'group-bot';
 const PUPPETEER_EXECUTABLE_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || null;
 
-// ~16 MB (limite prático do WhatsApp).
+// ~16 MB (limite prático do WhatsApp)
 const MAX_MEDIA_BYTES = 16 * 1024 * 1024;
 
 // ===== Estado por sessão =====
-// sessions: Map<string, SessionState>
 /**
  * SessionState = {
  *   client,
@@ -23,11 +22,15 @@ const MAX_MEDIA_BYTES = 16 * 1024 * 1024;
  *   qrBase64: string|null,
  *   hostWid: string|null,
  *   hostNumber: string|null,
- *   inFlight: Set<string>, // groupId em envio para evitar duplicatas
- *   _onMsgAttached: boolean, // evita listeners duplicados
+ *   inFlight: Set<string>, // evita duplicatas por grupo
+ *   _onMsgAttached: boolean,
  * }
  */
 const sessions = new Map();
+
+// locks (evitam corrida start/close por sessão)
+const creatingBySession = new Map(); // session -> Promise
+const closingBySession = new Map();  // session -> Promise
 
 let io = null;
 function setIO(ioInstance) { io = ioInstance; }
@@ -35,12 +38,11 @@ function setIO(ioInstance) { io = ioInstance; }
 // Helper para pegar o store (com fallback se ainda não houver forSession)
 function getStore(session) {
   if (typeof baseStore.forSession === 'function') return baseStore.forSession(session);
-  // fallback: store single-session (compat enquanto migramos)
-  return baseStore;
+  return baseStore; // legado single-session
 }
 
 // ===== Utilitários =====
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 const nowISO = () => new Date().toISOString();
 
 function normalizeStatus(s) {
@@ -50,7 +52,7 @@ function normalizeStatus(s) {
 function isConnectedSession(state) {
   if (!state?.client) return false;
   const s = normalizeStatus(state?.status?.status);
-  const ok = ['islogged', 'inchat', 'qrreadsuccess', 'connected', 'logged', 'online', 'main', 'normal'];
+  const ok = ['islogged','inchat','qrreadsuccess','connected','logged','online','main','normal'];
   return ok.includes(s);
 }
 function cleanMediaPath(p) {
@@ -78,22 +80,17 @@ function isEmptySnapshotMessage(m) {
   return !txt && !img && !aud && !vid;
 }
 function fileSizeOK(fp) {
-  try {
-    const { size } = fs.statSync(fp);
-    return size <= MAX_MEDIA_BYTES;
-  } catch { return false; }
+  try { return fs.statSync(fp).size <= MAX_MEDIA_BYTES; } catch { return false; }
 }
-function ensureDir(p) {
-  try { fs.mkdirSync(p, { recursive: true }); } catch {}
-}
+function ensureDir(p) { try { fs.mkdirSync(p, { recursive: true }); } catch {} }
 
-// Emite com o nome clássico e inclui {session} no payload para compat.
+// Emite (inclui {session} quando útil)
 function emit(event, payload) {
   if (!io) return;
   try { io.emit(event, payload); } catch {}
 }
 
-// ===== Grupos (por sessão) =====
+// ===== Grupos =====
 async function getGroupsSafe(session, maxRetries = 3) {
   const state = sessions.get(session);
   if (!state?.client) return [];
@@ -139,10 +136,10 @@ function shouldTargetGroup(session, groupId) {
   return selected.includes(groupId);
 }
 
-// ===== Resolução de mensagem efetiva (inclui video_path) =====
+// ===== Resolução de mensagem (suporta video_path) =====
 async function resolveEffectiveMessage(session, groupId) {
   const st = getStore(session);
-  const settings = st.getSettings(); // pode ou não ter video_path global (compat)
+  const settings = st.getSettings();
   const preset = st.getGroupPreset(groupId) || null;
 
   // 1) PRESET
@@ -150,7 +147,7 @@ async function resolveEffectiveMessage(session, groupId) {
     const msgs = Array.isArray(preset.messages) ? preset.messages : [];
     const rIdx = Number.isFinite(preset.rotate_index) ? Number(preset.rotate_index) : 0;
 
-    // 1.1) Snapshot (rotate)
+    // 1.1) Snapshot com rotação
     if (msgs.length > 0) {
       const safeIndex = ((rIdx % msgs.length) + msgs.length) % msgs.length;
       const cand = msgs[safeIndex] || null;
@@ -191,7 +188,7 @@ async function resolveEffectiveMessage(session, groupId) {
     }
   }
 
-  // 2) GLOBAL (template fixo / modo randômico / plain)
+  // 2) GLOBAL
   if (settings.global_template_id != null && getStore(session).templateExists(settings.global_template_id)) {
     const tpl = getStore(session).getTemplate(settings.global_template_id);
     const txt = textOf(tpl?.text);
@@ -208,7 +205,7 @@ async function resolveEffectiveMessage(session, groupId) {
   }
 
   if (settings.random_mode) {
-    const rtpl = getStore(session).pickRandomTemplate(); // já filtra vazio
+    const rtpl = getStore(session).pickRandomTemplate();
     if (rtpl) {
       return {
         text: textOf(rtpl.text),
@@ -221,12 +218,12 @@ async function resolveEffectiveMessage(session, groupId) {
     }
   }
 
-  // Texto/mídia globais (compat — video_path pode nem existir no settings antigo)
+  // 2.3) Texto/mídia globais
   return {
     text: textOf(settings.text_message),
     image_path: cleanMediaPath(settings.image_path),
     audio_path: cleanMediaPath(settings.audio_path),
-    video_path: cleanMediaPath(settings.video_path), // ok se undefined
+    video_path: cleanMediaPath(settings.video_path),
     threshold: settings.threshold ?? 10,
     _meta: { source: 'global:plain' }
   };
@@ -251,7 +248,7 @@ async function sendPresetToGroup(session, groupId) {
       return;
     }
 
-    // marca last_sent no início (protege cooldown em rajada)
+    // marca last_sent no início
     getStore(session).setLastSent(groupId, nowISO());
 
     if (files.length === 0) {
@@ -262,24 +259,20 @@ async function sendPresetToGroup(session, groupId) {
         const filename = safeBasename(filePath);
         const mimeType = mime.lookup(filename) || 'application/octet-stream';
 
-        // Tamanho máx. 16MB para qualquer mídia (especialmente vídeo)
         if (!fileSizeOK(filePath)) {
           console.warn(`[${session}] Skip media > 16MB: ${filename}`);
           continue;
         }
 
         const caption = i === 0 ? text : undefined;
-        // WPPConnect: client.sendFile(to, filePath, filename, caption, mimeType)
         await state.client.sendFile(groupId, filePath, filename, caption, mimeType);
       }
     }
 
-    // snapshot: avança rotate_index após envio OK
     if (msg?._meta?.source === 'preset:snapshot' && Number.isFinite(msg?._meta?.nextRotateIndex)) {
       getStore(session).bumpPresetRotateIndex(groupId, msg._meta.nextRotateIndex);
     }
 
-    // zera contador e emite atualização
     getStore(session).reset(groupId);
     emit('counter:update', { ...(getStore(session).getCounter(groupId) || {}), session });
   } catch (err) {
@@ -287,7 +280,7 @@ async function sendPresetToGroup(session, groupId) {
   }
 }
 
-// ===== Handler de mensagens recebidas (padrão interno) =====
+// ===== Handler de mensagens (default) =====
 async function onIncomingMessage(session, msg) {
   const state = sessions.get(session);
   if (!state?.client) return;
@@ -313,7 +306,7 @@ async function onIncomingMessage(session, msg) {
 
     if (fromMeFlag) return;
 
-    // upsert grupo (nome amigável)
+    // upsert grupo
     getStore(session).upsertGroup({
       id: groupId,
       name: msg.chat?.name || msg.sender?.shortName || msg.sender?.pushname || 'Grupo',
@@ -357,18 +350,22 @@ async function onIncomingMessage(session, msg) {
   }
 }
 
-// ===== Lifecycle de sessão =====
-// ATENÇÃO: agora aceita hooks com onMessage; se não vier, usa handler interno.
-async function startSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
+// ===== Lifecycle =====
+async function _reallyStartSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
+  // reemite status/QR se já conectado
   let state = sessions.get(session);
   if (state && isConnectedSession(state)) {
-    // já existe/está logado — reemite status/QR
     emit('wpp:status', { ...(state.status || {}), session, hasClient: !!state.client, hasQR: !!state.qrBase64 });
     if (state.qrBase64) emit('wpp:qr', { session, base64: state.qrBase64, base64Qr: state.qrBase64, attempts: 0 });
     return state.client;
   }
 
-  // cria estado novo
+  // fecha cliente zumbi (SEM logout)
+  if (state?.client) {
+    try { await state.client.close?.(); } catch {}
+  }
+
+  // novo estado
   state = {
     client: null,
     status: { status: 'STARTING' },
@@ -381,23 +378,52 @@ async function startSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
   sessions.set(session, state);
   emit('wpp:status', { ...(state.status), session });
 
-  // Garante pastas no volume persistido
+  // pastas persistentes
   ensureDir(path.join(__dirname, '..', WPP_DATA_DIR, session));
 
+  // caminhos dedicados por sessão
+  const sessionRoot = path.join(WPP_DATA_DIR, session);
+  const tokenDir = path.join(sessionRoot, 'tokens');     // onde salvamos tokens (wppconnect tokenStore:'file')
+  const profileDir = path.join(sessionRoot, 'profile');  // perfil do Chromium desta sessão (puppeteer userDataDir)
+
+  ensureDir(path.join(__dirname, '..', tokenDir));
+  ensureDir(path.join(__dirname, '..', profileDir));
+
+  // CreateOptions: tokens em arquivo + perfil isolado por sessão
   const createOpts = {
     session,
-    // isola o perfil por sessão — evita lock do Chromium quando múltiplos containers/processos
-    mkdirFolderToken: true,
-    folderNameToken: path.join(WPP_DATA_DIR, session),
-    createPathFileToken: true,
+
+    // Persistência de tokens em arquivo por sessão
+    tokenStore: 'file',
+    folderNameToken: tokenDir, // pasta relativa ao projeto (dentro de WPP_DATA_DIR/session/tokens) :contentReference[oaicite:0]{index=0}
+
+    // Estabilidade de login/sync
+    waitForLogin: true,
     autoClose: 0,
+    deviceSyncTimeout: Number(process.env.WPP_DEVICE_SYNC_TIMEOUT || 180000),
+
+    // Execução do Chromium
+    useChrome: false,
+    headless: true,
+    logQR: false,
+    updatesLog: true,
+    debug: false,
+
     puppeteerOptions: {
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      // Perfil separado por sessão → facilita “wipe” seguro depois
+      userDataDir: path.join(__dirname, '..', profileDir), // puppeteer.launch({ userDataDir }) :contentReference[oaicite:1]{index=1}
       ...(PUPPETEER_EXECUTABLE_PATH ? { executablePath: PUPPETEER_EXECUTABLE_PATH } : {}),
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-zygote'
+      ],
     },
-    catchQR: (base64Qr, /* asciiQR */ _ascii, attempts /* , urlCode */) => {
-      // Guarda APENAS o base64 cru (sem prefixo), compat com front atual
+
+    catchQR: (base64Qr, _ascii, attempts) => {
       const raw = String(base64Qr || '')
         .replace(/^data:image\/png;base64,?/i, '')
         .replace(/\s+/g, '');
@@ -408,18 +434,32 @@ async function startSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
       }
       emit('wpp:qr', { session, base64: state.qrBase64, base64Qr: state.qrBase64, attempts: Number(attempts) || 0 });
     },
+
     statusFind: (statusSession) => {
       state.status = { status: statusSession };
       emit('wpp:status', { ...(state.status), session });
     },
+
+    onLoadingScreen: (percent, message) => {
+      emit('wpp:loading', { session, percent, message });
+    },
   };
 
-  state.client = await wppconnect.create(createOpts);
+  // criação com fallback
+  try {
+    state.client = await wppconnect.create(createOpts);
+  } catch (err) {
+    console.warn(`[${session}] create() falhou: ${err?.message || err}`);
+    // último recurso: limpar tokens e tentar novamente 1x
+    try { cleanupSessionData(session); } catch {}
+    await sleep(700);
+    state.client = await wppconnect.create(createOpts);
+  }
 
   try { state.hostWid = await state.client.getWid?.(); } catch {}
   try { state.hostNumber = await state.client.getHostNumber?.(); } catch {}
 
-  // Listener por sessão: usa hooks.onMessage se fornecido; senão o handler interno
+  // listeners
   if (typeof state.client?.onMessage === 'function' && !state._onMsgAttached) {
     if (hooks?.onMessage && typeof hooks.onMessage === 'function') {
       state.client.onMessage((m) => hooks.onMessage(m));
@@ -429,7 +469,15 @@ async function startSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
     state._onMsgAttached = true;
   }
 
-  // Primeira carga de grupos (tentativas)
+  try {
+    if (typeof state.client?.onStateChange === 'function') {
+      state.client.onStateChange((st) => {
+        emit('wpp:state', { session, state: st });
+      });
+    }
+  } catch {}
+
+  // carga inicial de grupos
   (async () => {
     for (const ms of [2000, 5000, 10000]) {
       await sleep(ms);
@@ -442,17 +490,27 @@ async function startSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
   return state.client;
 }
 
+// start com lock (evita corrida com close)
+async function startSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
+  if (creatingBySession.has(session)) return creatingBySession.get(session);
+  const p = (async () => _reallyStartSession(session, hooks))()
+    .finally(() => creatingBySession.delete(session));
+  creatingBySession.set(session, p);
+  return p;
+}
+
 // Wrapper compatível com o seu bot.js
 async function createSession(session = SESSION_NAME_DEFAULT, ioInstance = null, hooks = {}) {
   if (ioInstance) setIO(ioInstance);
   return startSession(session, hooks);
 }
 
-async function closeSession(session = SESSION_NAME_DEFAULT) {
+// (A) “Desconectar” NÃO deve deslogar
+async function _closeOnly(session) {
   const state = sessions.get(session);
   try {
     if (state?.client) {
-      await state.client.logout?.();
+      // NÃO deslogar! Apenas fechar o navegador para manter os tokens válidos.
       await state.client.close?.();
     }
   } catch (e) {
@@ -462,15 +520,95 @@ async function closeSession(session = SESSION_NAME_DEFAULT) {
       state.client = null;
       state.status = { status: 'DISCONNECTED' };
       state.qrBase64 = null;
-      state.inFlight.clear();
+      state.inFlight?.clear?.();
       state._onMsgAttached = false;
       emit('wpp:status', { ...(state.status), session });
     }
-    // mantemos no Map com status = DISCONNECTED (útil para UI)
+    // mantemos o objeto no Map com status DISCONNECTED (útil para UI)
   }
 }
 
-// ===== Acesso/estado (para o bot.js) =====
+async function closeSession(session = SESSION_NAME_DEFAULT) {
+  if (closingBySession.has(session)) return closingBySession.get(session);
+  const p = (async () => _closeOnly(session))()
+    .finally(() => closingBySession.delete(session));
+  closingBySession.set(session, p);
+  return p;
+}
+
+/**
+ * Reset/Wipe definitivo da sessão:
+ * - Fecha o cliente (sem logout)
+ * - Remove diretório .wpp-data/<session> inteiro (tokens + perfil do Chromium)
+ * - Faz retries com backoff (Windows pode segurar arquivos por milissegundos)
+ */
+async function wipeSession(session = SESSION_NAME_DEFAULT) {
+  await closeSession(session);
+
+  const base = path.resolve(path.join(__dirname, '..', WPP_DATA_DIR));
+  const target = path.resolve(path.join(base, session));
+
+  // segurança: target deve estar DENTRO de base
+  if (!target.startsWith(base)) {
+    throw new Error('Alvo inválido para wipe.');
+  }
+
+  // tenta remover com retries/backoff
+  let lastErr = null;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    try {
+      fs.rmSync(target, { recursive: true, force: true });
+      if (!fs.existsSync(target)) break; // sucesso
+    } catch (e) {
+      lastErr = e;
+    }
+    await sleep(250 * (attempt + 1));
+  }
+
+  if (fs.existsSync(target)) {
+    // tentativa “manual” extra (CHMOD e remoção recursiva)
+    try {
+      forceRemoveDir(target);
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+
+  if (fs.existsSync(target)) {
+    throw lastErr || new Error('Falha ao limpar sessão: arquivos ainda em uso.');
+  }
+
+  // mantém status coerente e notifica
+  const state = sessions.get(session);
+  if (state) {
+    state.client = null;
+    state.qrBase64 = null;
+    state.status = { status: 'DISCONNECTED' };
+    state.inFlight?.clear?.();
+    state._onMsgAttached = false;
+  }
+  emit('wpp:status', { session, status: 'DISCONNECTED' });
+  return true;
+}
+
+// Remove diretório mesmo em cenários “chatos” (Windows/locks espúrios)
+function forceRemoveDir(dir) {
+  if (!fs.existsSync(dir)) return;
+  for (const entry of fs.readdirSync(dir)) {
+    const p = path.join(dir, entry);
+    let stat;
+    try { stat = fs.lstatSync(p); } catch { continue; }
+    try { fs.chmodSync(p, 0o666); } catch {}
+    if (stat.isDirectory() && !stat.isSymbolicLink()) {
+      forceRemoveDir(p);
+    } else {
+      try { fs.rmSync(p, { force: true }); } catch {}
+    }
+  }
+  try { fs.rmdirSync(dir); } catch {}
+}
+
+// ===== Acesso/estado =====
 function getClient(session = SESSION_NAME_DEFAULT) {
   const st = sessions.get(session);
   return st?.client || null;
@@ -503,8 +641,7 @@ function listSessions() {
   return out;
 }
 
-// Remove somente a pasta da sessão (para "resetar" o login)
-// Retorna true/false
+// Remove somente a pasta da sessão (para "resetar" o login) — utilitário interno
 function cleanupSessionData(session = SESSION_NAME_DEFAULT) {
   try {
     const tokenPath = path.join(__dirname, '..', WPP_DATA_DIR, session);
@@ -524,11 +661,12 @@ module.exports = {
   setIO,
 
   // Sessão
-  startSession,        // ainda exposto (agora aceita hooks)
-  createSession,       // compat com bot.js
+  startSession,
+  createSession,
   closeSession,
-  getClient,           // compat com bot.js
-  isConnected,         // compat com bot.js
+  wipeSession,          // << NOVO: reset definitivo
+  getClient,
+  isConnected,
   getStatus,
   getQR,
   listSessions,
@@ -541,7 +679,7 @@ module.exports = {
   // Envio
   sendPresetToGroup,
 
-  // Acesso direto (se precisar)
+  // Acesso direto (debug)
   _sessions: sessions,
   _getStore: getStore,
 };

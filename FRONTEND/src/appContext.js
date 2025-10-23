@@ -314,7 +314,12 @@ export const AppProvider = ({ children }) => {
     socket.on('counter:update', (row) => {
       if (row?.group_id) setCounters((prev) => ({ ...prev, [row.group_id]: row }));
     });
-    socket.on('groups:refresh', (g) => { setGroups(Array.isArray(g) ? g : []); });
+
+    // Aceita tanto payload antigo (array) quanto novo ({ session, groups })
+    socket.on('groups:refresh', (payload) => {
+      if (Array.isArray(payload)) setGroups(payload);
+      else if (payload && Array.isArray(payload.groups)) setGroups(payload.groups);
+    });
 
     return () => { socket.close(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -354,6 +359,9 @@ export const AppProvider = ({ children }) => {
 
         // Sessão: ações
         start, disconnect, resetSession,
+
+        // Alias para compatibilidade com código antigo
+        resetTokens: resetSession,
 
         // Loads (caso precise disparar manualmente)
         loadGroups, loadGroupPresets, loadTemplates,

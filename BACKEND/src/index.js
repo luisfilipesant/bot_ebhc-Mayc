@@ -9,7 +9,7 @@ const path = require('path');
 const fs = require('fs');
 
 const store = require('./store');
-const bot = require('./bot');
+const bot = require('./bot'); // aponta para sessionManager.js
 const { pick } = require('./utils');
 
 const PORT = process.env.PORT || 3000;
@@ -87,7 +87,14 @@ io.on('connection', (socket) => {
     const status = bot.getStatus(session);
     socket.emit('wpp:status', status);
     const qr = bot.getQR(session);
-    if (qr) socket.emit('wpp:qr', { base64Qr: qr, attempts: 0 });
+    if (qr) {
+      socket.emit('wpp:qr', {
+        session,
+        base64: qr,
+        base64Qr: qr,
+        attempts: 0
+      });
+    }
   } catch {
     // sessão ainda não criada; tudo bem
   }
@@ -99,7 +106,14 @@ io.on('connection', (socket) => {
     const status = bot.getStatus(target);
     socket.emit('wpp:status', status);
     const qr = bot.getQR(target);
-    if (qr) socket.emit('wpp:qr', { base64Qr: qr, attempts: 0 });
+    if (qr) {
+      socket.emit('wpp:qr', {
+        session: target,
+        base64: qr,
+        base64Qr: qr,
+        attempts: 0
+      });
+    }
   });
 });
 
@@ -121,7 +135,7 @@ function registerApi(prefix, resolveSession) {
     const session = resolveSession(req);
     const qr = bot.getQR(session);
     if (!qr) return res.status(404).json({ ok: false, error: 'QR indisponível' });
-    res.json({ ok: true, base64Qr: qr });
+    res.json({ ok: true, session, base64: qr, base64Qr: qr });
   });
 
   // START
@@ -134,7 +148,14 @@ function registerApi(prefix, resolveSession) {
     } else {
       io.to(session).emit('wpp:status', bot.getStatus(session));
       const qr = bot.getQR(session);
-      if (qr) io.to(session).emit('wpp:qr', { base64Qr: qr, attempts: 0 });
+      if (qr) {
+        io.to(session).emit('wpp:qr', {
+          session,
+          base64: qr,
+          base64Qr: qr,
+          attempts: 0
+        });
+      }
     }
     res.json({ ok: true, settings: s });
   });
@@ -146,11 +167,11 @@ function registerApi(prefix, resolveSession) {
     res.json({ ok: true, settings: s });
   });
 
-  // DISCONNECT (encerra sessão WPP)
+  // DISCONNECT (encerra sessão WPP sem logout)
   app.post(`${prefix}/bot/disconnect`, async (req, res) => {
     const session = resolveSession(req);
     await bot.closeSession(session);
-    io.to(session).emit('wpp:status', { status: 'DISCONNECTED' });
+    io.to(session).emit('wpp:status', { session, status: 'DISCONNECTED' });
     res.json({ ok: true });
   });
 
@@ -162,7 +183,7 @@ function registerApi(prefix, resolveSession) {
       if (!groups.length) {
         setTimeout(async () => {
           const g2 = await bot.ensureGroupsPersisted(session);
-          io.to(session).emit('groups:refresh', g2);
+          io.to(session).emit('groups:refresh', { session, groups: g2 });
         }, 2000);
       }
       res.json(groups);
@@ -392,25 +413,10 @@ function registerApi(prefix, resolveSession) {
   app.post(`${prefix}/session/wipe`, async (req, res) => {
     try {
       const session = resolveSession(req);
-
-      // 1) encerra sessão corrente
-      await bot.closeSession(session);
-
-      // 2) apaga pasta de token
-      const base = path.resolve(path.join(__dirname, '..', process.env.WPP_DATA_DIR || '.wpp-data'));
-      const target = path.join(base, session);
-
-      // segurança: garantir que o target esteja dentro de base
-      if (!path.resolve(target).startsWith(base)) {
-        return res.status(400).json({ ok:false, error:'Alvo inválido para wipe.' });
-      }
-
-      fs.rmSync(target, { recursive: true, force: true });
-
-      // 3) avisa apenas a sala da sessão
-      io.to(session).emit('wpp:status', { status: 'DISCONNECTED' });
-
-      return res.json({ ok: true, wiped: target, session });
+      // usa a função robusta do sessionManager (fecha + apaga com retries)
+      await bot.wipeSession(session);
+      io.to(session).emit('wpp:status', { session, status: 'DISCONNECTED' });
+      return res.json({ ok: true, wiped: session });
     } catch (e) {
       console.error('wipe session error:', e);
       return res.status(500).json({ ok:false, error: e.message || 'Falha ao limpar sessão' });
@@ -431,7 +437,7 @@ function registerApi(prefix, resolveSession) {
     const session = resolveSession(req);
     store.forSession(session).reset(req.params.groupId);
     const row = store.forSession(session).getCounter(req.params.groupId);
-    io.to(session).emit('counter:update', row);
+    io.to(session).emit('counter:update', { ...(row || {}), session });
     res.json({ ok: true, counter: row });
   });
 }
