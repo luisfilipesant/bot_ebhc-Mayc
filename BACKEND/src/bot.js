@@ -84,39 +84,12 @@ function getClient(session) {
 
 // ======= Grupos (por sessão) =======
 async function getGroupsSafe(session, maxRetries = 3) {
-  const client = getClient(session);
-  if (!client) return [];
-  let lastErr = null;
-
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    try {
-      const out = [];
-      if (typeof client.listChats === 'function') {
-        const chats = await client.listChats();
-        for (const c of (chats || [])) {
-          const id = c?.id?._serialized || c?.id;
-          if (typeof id === 'string' && id.endsWith('@g.us')) {
-            const name = c.name || c.formattedTitle || c.groupMetadata?.subject || 'Grupo';
-            out.push({ id, name });
-          }
-        }
-      }
-      out.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
-      return out;
-    } catch (e) {
-      lastErr = e;
-      await sleep(1500);
-    }
-  }
-  console.warn(`[${session}] getGroupsSafe falhou após retries:`, lastErr?.message);
-  return [];
+  // reutiliza o otimizado do sessionManager
+  return sessionManager.getGroupsSafe(session, maxRetries);
 }
 
 async function ensureGroupsPersisted(session) {
-  const groups = await getGroupsSafe(session);
-  const s = store.forSession(session);
-  groups.forEach((g) => s.upsertGroup(g));
-  return groups;
+  return sessionManager.ensureGroupsPersisted(session);
 }
 
 function shouldTargetGroup(session, groupId) {
@@ -270,7 +243,6 @@ async function sendPresetToGroup(session, groupId) {
         }
 
         const caption = !usedCaption ? text : undefined;
-        // wppconnect aceita: sendFile(to, filePath, filename, caption)
         await client.sendFile(groupId, filePath, filename, caption);
         usedCaption = true;
       }
@@ -289,7 +261,8 @@ async function sendPresetToGroup(session, groupId) {
     }
 
     s.reset(groupId);
-    if (io) io.emit('counter:update', { ...s.getCounter(groupId), session });
+    if (io?.to) io.to(session).emit('counter:update', { ...s.getCounter(groupId), session });
+    else if (io?.emit) io.emit('counter:update', { ...s.getCounter(groupId), session });
   } catch (err) {
     console.error(`[${session}] Erro ao enviar preset:`, err.message);
   }
@@ -303,12 +276,10 @@ async function onIncomingMessage(session, msg) {
     const isGroup = msg.isGroupMsg || (groupId && isGroupId(groupId));
     if (!isGroup) return;
 
-    // detectar mensagens próprias
-    const client = getClient(session);
-    let hostWid = null;
-    let hostNumber = null;
-    try { hostWid = await client.getWid?.(); } catch {}
-    try { hostNumber = await client.getHostNumber?.(); } catch {}
+    // Evita chamadas caras: usa cache de host da sessão
+    const st = sessionManager._sessions.get(session);
+    const hostWid = st?.hostWid || null;
+    const hostNumber = st?.hostNumber || null;
 
     const authorId =
       msg.author ||
@@ -335,7 +306,8 @@ async function onIncomingMessage(session, msg) {
 
     // contador
     s.increment(groupId);
-    if (io) io.emit('counter:update', { ...s.getCounter(groupId), session });
+    if (io?.to) io.to(session).emit('counter:update', { ...s.getCounter(groupId), session });
+    else if (io?.emit) io.emit('counter:update', { ...s.getCounter(groupId), session });
 
     // threshold (grupo > global)
     const grpCfg = s.getGroupPreset(groupId) || null;
@@ -388,7 +360,7 @@ async function createSession(session, ioInstance) {
       const groups = await ensureGroupsPersisted(session);
       if (groups.length > 0) break;
     }
-    // intencionalmente não emitimos groups:refresh aqui para evitar conflito de payload
+    // não emitimos groups:refresh aqui (o manager já faz)
   })();
 
   return client;

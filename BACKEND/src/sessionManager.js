@@ -100,6 +100,7 @@ async function getGroupsSafe(session, maxRetries = 3) {
     try {
       const out = [];
       if (typeof state.client.listChats === 'function') {
+        // IMPORTANTE: listChats (depreca getAllGroups) — filtrando por @g.us
         const chats = await state.client.listChats();
         for (const c of (chats || [])) {
           const id = c?.id?._serialized || c?.id;
@@ -120,11 +121,24 @@ async function getGroupsSafe(session, maxRetries = 3) {
   return [];
 }
 
+// Persiste (DB) e retorna
 async function ensureGroupsPersisted(session) {
   const st = getStore(session);
   const groups = await getGroupsSafe(session);
   groups.forEach((g) => st.upsertGroup(g));
   return groups;
+}
+
+// NOVO: refresh explícito, com emissão opcional
+async function refreshGroups(session, { emitSocket = true, retries = 3, delaySeries = [0, 1500, 6000] } = {}) {
+  // fazemos algumas tentativas espaçadas para esperar a sincronização do WA
+  let last = [];
+  for (const d of delaySeries) {
+    if (d > 0) await sleep(d);
+    last = await ensureGroupsPersisted(session);
+  }
+  if (emitSocket) emit('groups:refresh', { session, groups: last });
+  return last;
 }
 
 function shouldTargetGroup(session, groupId) {
@@ -351,6 +365,16 @@ async function onIncomingMessage(session, msg) {
 }
 
 // ===== Lifecycle =====
+const CONNECTED_STATES = new Set(['islogged','inchat','qrreadsuccess','connected','logged','online','main','normal']);
+
+function scheduleRefreshOnConnect(session, statusStr) {
+  const st = normalizeStatus(statusStr);
+  if (!CONNECTED_STATES.has(st)) return;
+  // Faz 3 passadas para pegar grupos logo após a sync do WA
+  refreshGroups(session, { emitSocket: true, delaySeries: [0, 1500, 6000] })
+    .catch((e) => console.warn(`[${session}] refresh pós-conexão falhou:`, e?.message));
+}
+
 async function _reallyStartSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
   // reemite status/QR se já conectado
   let state = sessions.get(session);
@@ -383,8 +407,8 @@ async function _reallyStartSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
 
   // caminhos dedicados por sessão
   const sessionRoot = path.join(WPP_DATA_DIR, session);
-  const tokenDir = path.join(sessionRoot, 'tokens');     // onde salvamos tokens (wppconnect tokenStore:'file')
-  const profileDir = path.join(sessionRoot, 'profile');  // perfil do Chromium desta sessão (puppeteer userDataDir)
+  const tokenDir = path.join(sessionRoot, 'tokens');     // onde salvamos tokens
+  const profileDir = path.join(sessionRoot, 'profile');  // perfil do Chromium
 
   ensureDir(path.join(__dirname, '..', tokenDir));
   ensureDir(path.join(__dirname, '..', profileDir));
@@ -393,16 +417,13 @@ async function _reallyStartSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
   const createOpts = {
     session,
 
-    // Persistência de tokens em arquivo por sessão
     tokenStore: 'file',
-    folderNameToken: tokenDir, // pasta relativa ao projeto (dentro de WPP_DATA_DIR/session/tokens) :contentReference[oaicite:0]{index=0}
+    folderNameToken: tokenDir,
 
-    // Estabilidade de login/sync
     waitForLogin: true,
     autoClose: 0,
     deviceSyncTimeout: Number(process.env.WPP_DEVICE_SYNC_TIMEOUT || 180000),
 
-    // Execução do Chromium
     useChrome: false,
     headless: true,
     logQR: false,
@@ -411,8 +432,7 @@ async function _reallyStartSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
 
     puppeteerOptions: {
       headless: true,
-      // Perfil separado por sessão → facilita “wipe” seguro depois
-      userDataDir: path.join(__dirname, '..', profileDir), // puppeteer.launch({ userDataDir }) :contentReference[oaicite:1]{index=1}
+      userDataDir: path.join(__dirname, '..', profileDir),
       ...(PUPPETEER_EXECUTABLE_PATH ? { executablePath: PUPPETEER_EXECUTABLE_PATH } : {}),
       args: [
         '--no-sandbox',
@@ -438,6 +458,8 @@ async function _reallyStartSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
     statusFind: (statusSession) => {
       state.status = { status: statusSession };
       emit('wpp:status', { ...(state.status), session });
+      // NOVO: assim que “conectado”, força sync dos grupos
+      scheduleRefreshOnConnect(session, statusSession);
     },
 
     onLoadingScreen: (percent, message) => {
@@ -473,11 +495,13 @@ async function _reallyStartSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
     if (typeof state.client?.onStateChange === 'function') {
       state.client.onStateChange((st) => {
         emit('wpp:state', { session, state: st });
+        // NOVO: também dispara refresh quando o WebSocket volta
+        scheduleRefreshOnConnect(session, st);
       });
     }
   } catch {}
 
-  // carga inicial de grupos
+  // carga inicial de grupos (quando for um login “frio”)
   (async () => {
     for (const ms of [2000, 5000, 10000]) {
       await sleep(ms);
@@ -664,7 +688,7 @@ module.exports = {
   startSession,
   createSession,
   closeSession,
-  wipeSession,          // << NOVO: reset definitivo
+  wipeSession,          // reset definitivo
   getClient,
   isConnected,
   getStatus,
@@ -675,6 +699,7 @@ module.exports = {
   // Grupos
   getGroupsSafe,
   ensureGroupsPersisted,
+  refreshGroups,        // << NOVO: refresh explícito pós-conexão e endpoint
 
   // Envio
   sendPresetToGroup,

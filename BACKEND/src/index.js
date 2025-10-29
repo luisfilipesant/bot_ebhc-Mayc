@@ -9,7 +9,7 @@ const path = require('path');
 const fs = require('fs');
 
 const store = require('./store');
-const bot = require('./bot'); // aponta para sessionManager.js
+const bot = require('./bot'); // (seu wrapper que delega pro sessionManager)
 const { pick } = require('./utils');
 
 const PORT = process.env.PORT || 3000;
@@ -60,7 +60,6 @@ fs.mkdirSync(uploadBaseDir, { recursive: true });
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    // se a rota for /api/:session/... teremos req.params.session; no alias legado, cai no fallback
     const session = sanitizeSession(req.params?.session || SESSION_FALLBACK);
     const dir = path.join(uploadBaseDir, session);
     fs.mkdirSync(dir, { recursive: true });
@@ -77,12 +76,10 @@ const upload = multer({ storage });
 
 // ---------- Socket.IO ----------
 io.on('connection', (socket) => {
-  // Lê a sessão do query (?session=foo) e entra na sala
   const raw = socket.handshake?.query?.session;
   const session = sanitizeSession(raw);
   socket.join(session);
 
-  // Envia status/QR iniciais apenas para a sala da sessão
   try {
     const status = bot.getStatus(session);
     socket.emit('wpp:status', status);
@@ -96,10 +93,9 @@ io.on('connection', (socket) => {
       });
     }
   } catch {
-    // sessão ainda não criada; tudo bem
+    // sessão ainda não criada; ok
   }
 
-  // Também permitimos entrar em outra sessão dinamicamente
   socket.on('session:join', (s) => {
     const target = sanitizeSession(s);
     socket.join(target);
@@ -175,7 +171,7 @@ function registerApi(prefix, resolveSession) {
     res.json({ ok: true });
   });
 
-  // GRUPOS
+  // GRUPOS (carrega e retorna; agendando refresh se vier vazio)
   app.get(`${prefix}/groups`, async (req, res) => {
     const session = resolveSession(req);
     try {
@@ -189,6 +185,18 @@ function registerApi(prefix, resolveSession) {
       res.json(groups);
     } catch (e) {
       res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
+  // NOVO: REFRESH manual imediato dos grupos
+  app.get(`${prefix}/groups/refresh`, async (req, res) => {
+    const session = resolveSession(req);
+    try {
+      const groups = await bot.ensureGroupsPersisted(session);
+      io.to(session).emit('groups:refresh', { session, groups });
+      return res.json({ ok: true, groups });
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: e.message });
     }
   });
 
@@ -315,16 +323,13 @@ function registerApi(prefix, resolveSession) {
       const session = resolveSession(req);
       const id = Number(req.params.id);
 
-      // limpa template_id dos presets da sessão
       store.forSession(session).clearTemplateFromPresets(id);
 
-      // se for o template global, limpa nas settings da sessão
       const s = store.forSession(session).getSettings();
       if (s.global_template_id === id) {
         store.forSession(session).updateSettings({ global_template_id: null });
       }
 
-      // remove o template
       store.forSession(session).deleteTemplate(id);
       res.json({ ok: true });
     } catch (e) {
@@ -409,11 +414,10 @@ function registerApi(prefix, resolveSession) {
     }
   );
 
-  // ---------- Reset/Wipe tokens da sessão (pasta .wpp-data/<session>) ----------
+  // ---------- Reset/Wipe tokens da sessão ----------
   app.post(`${prefix}/session/wipe`, async (req, res) => {
     try {
       const session = resolveSession(req);
-      // usa a função robusta do sessionManager (fecha + apaga com retries)
       await bot.wipeSession(session);
       io.to(session).emit('wpp:status', { session, status: 'DISCONNECTED' });
       return res.json({ ok: true, wiped: session });
@@ -470,3 +474,5 @@ server.listen(PORT, async () => {
   console.log(`Servidor rodando em http://localhost:${PORT}`);
   // sessões são criadas sob demanda via /api/:session/bot/start
 });
+
+module.exports = { io };
