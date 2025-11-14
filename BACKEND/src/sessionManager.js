@@ -111,41 +111,60 @@ async function _isReallyLogged(state) {
   }
 }
 
-async function getGroupsSafe(session, maxRetries = 3) {
+// Preferir getAllGroups(true); fallback p/ listChats() e getAllChats()
+async function getGroupsSafe(session, maxRetries = 5) {
   const state = sessions.get(session);
   if (!state?.client) return [];
   let lastErr = null;
 
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       // gate: só tenta se de fato logado/sync ativo
       const ok = await _isReallyLogged(state);
       if (!ok) {
-        await sleep(1200);
+        await sleep(800 + attempt * 200);
         continue;
       }
 
-      const out = [];
-      if (typeof state.client.listChats === 'function') {
-        // listChats (depreca getAllGroups) — filtrando por @g.us
+      let out = [];
+
+      if (typeof state.client.getAllGroups === 'function') {
+        // includeParticipating = true
+        const list = await state.client.getAllGroups(true);
+        out = (list || []).map((g) => ({
+          id: g?.id?._serialized || g?.id || g?.wid?._serialized || g?.wid || '',
+          name: g?.name || g?.subject || g?.formattedTitle || g?.groupMetadata?.subject || 'Grupo',
+        })).filter(x => typeof x.id === 'string' && x.id.endsWith('@g.us'));
+      } else if (typeof state.client.listChats === 'function') {
         const chats = await state.client.listChats();
-        for (const c of (chats || [])) {
-          const id = c?.id?._serialized || c?.id;
-          if (typeof id === 'string' && id.endsWith('@g.us')) {
-            const name = c.name || c.formattedTitle || c.groupMetadata?.subject || 'Grupo';
-            out.push({ id, name });
-          }
-        }
+        out = (chats || []).map((c) => ({
+          id: c?.id?._serialized || c?.id || '',
+          name: c?.name || c?.formattedTitle || c?.groupMetadata?.subject || 'Grupo',
+        })).filter(x => typeof x.id === 'string' && x.id.endsWith('@g.us'));
+      } else if (typeof state.client.getAllChats === 'function') {
+        const chats = await state.client.getAllChats();
+        out = (chats || []).map((c) => ({
+          id: c?.id?._serialized || c?.id || '',
+          name: c?.name || c?.formattedTitle || 'Grupo',
+        })).filter(x => typeof x.id === 'string' && x.id.endsWith('@g.us'));
+      } else {
+        throw new Error('No suitable API (getAllGroups/listChats/getAllChats)');
       }
+
       out.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
       return out;
     } catch (e) {
       lastErr = e;
+      console.warn(`[${session}] getGroupsSafe attempt ${attempt} failed:`, e?.message || e);
       // Em casos de "Runtime.callFunctionOn timed out" / "Target closed", dá um respiro maior
-      await sleep(1500 + attempt * 1000);
+      await sleep(1000 * attempt); // backoff linear
     }
   }
-  console.warn(`[${session}] getGroupsSafe falhou após retries:`, lastErr?.message);
+
+  console.warn(
+    `[${session}] getGroupsSafe falhou após retries:`,
+    lastErr?.message || lastErr
+  );
   return [];
 }
 
@@ -160,13 +179,12 @@ async function ensureGroupsPersisted(session) {
 // Refresh explícito, com emissão opcional e múltiplas passadas (espera sync do WA)
 async function refreshGroups(
   session,
-  { emitSocket = true, delaySeries = [0, 1500, 6000, 12000] } = {}
+  { emitSocket = true, delaySeries = [0, 1500, 6000, 12000, 20000] } = {}
 ) {
   let last = [];
   for (const d of delaySeries) {
     if (d > 0) await sleep(d);
     last = await ensureGroupsPersisted(session);
-    // se já veio algo, segue acumulando mais uma passada para “completar”
   }
   if (emitSocket) emit('groups:refresh', { session, groups: last });
   return last;
