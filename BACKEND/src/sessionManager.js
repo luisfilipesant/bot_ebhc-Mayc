@@ -1,4 +1,5 @@
 // BACKEND/src/sessionManager.js
+/* eslint-disable no-console */
 const wppconnect = require('@wppconnect-team/wppconnect');
 const path = require('path');
 const fs = require('fs');
@@ -6,15 +7,21 @@ const mime = require('mime-types');
 const { isGroupId } = require('./utils');
 const baseStore = require('./store');
 
-// ===== Config =====
+/** =========================
+ *  Config (via ENV)
+ *  ========================= */
 const WPP_DATA_DIR = process.env.WPP_DATA_DIR || '.wpp-data';
 const SESSION_NAME_DEFAULT = process.env.SESSION_NAME || 'group-bot';
-const PUPPETEER_EXECUTABLE_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || null;
+const PUPPETEER_EXECUTABLE_PATH =
+  process.env.PUPPETEER_EXECUTABLE_PATH && String(process.env.PUPPETEER_EXECUTABLE_PATH).trim()
+    ? process.env.PUPPETEER_EXECUTABLE_PATH
+    : null;
 
-// Timeouts e auto close
+// Timeouts (ms)
 const WPP_DEVICE_SYNC_TIMEOUT = Number(process.env.WPP_DEVICE_SYNC_TIMEOUT || 300000); // 5 min
 const WPP_PROTOCOL_TIMEOUT = Number(process.env.WPP_PROTOCOL_TIMEOUT || 300000);       // 5 min
-// aceita "false" (string) para desativar de vez, ou número (ms) — 0 também desativa
+
+// AutoClose (desliga com "false" string, ou 0/false)
 const WPP_AUTO_CLOSE =
   process.env.WPP_AUTO_CLOSE === undefined
     ? 0
@@ -22,10 +29,12 @@ const WPP_AUTO_CLOSE =
         ? false
         : Number(process.env.WPP_AUTO_CLOSE) || 0);
 
-// ~16 MB (limite prático do WhatsApp)
+// Limite prático do WhatsApp (~16MB)
 const MAX_MEDIA_BYTES = 16 * 1024 * 1024;
 
-// ===== Estado por sessão =====
+/** =========================
+ *  Estado
+ *  ========================= */
 /**
  * SessionState = {
  *   client,
@@ -38,43 +47,31 @@ const MAX_MEDIA_BYTES = 16 * 1024 * 1024;
  * }
  */
 const sessions = new Map();
-
-// locks (evitam corrida start/close por sessão)
-const creatingBySession = new Map(); // session -> Promise
-const closingBySession = new Map();  // session -> Promise
+const creatingBySession = new Map(); // session -> Promise (lock start)
+const closingBySession = new Map();  // session -> Promise (lock close)
 
 let io = null;
 function setIO(ioInstance) { io = ioInstance; }
 
-// Helper para pegar o store (com fallback se ainda não houver forSession)
+// Store multi-sessão (fallback p/ legado single-session)
 function getStore(session) {
   if (typeof baseStore.forSession === 'function') return baseStore.forSession(session);
-  return baseStore; // legado single-session
+  return baseStore;
 }
 
-// ===== Utilitários =====
+/** =========================
+ *  Helpers
+ *  ========================= */
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 const nowISO = () => new Date().toISOString();
+function normalizeStatus(s) { return String(s || '').trim().toLowerCase(); }
+function textOf(x) { return String(x || '').trim(); }
+function cleanMediaPath(p) { return (p && String(p).trim()) ? p : null; }
+function safeBasename(p) { try { return path.basename(p); } catch { return 'file'; } }
+function ensureDir(p) { try { fs.mkdirSync(p, { recursive: true }); } catch {} }
+function fileSizeOK(fp) { try { return fs.statSync(fp).size <= MAX_MEDIA_BYTES; } catch { return false; } }
+function emit(event, payload) { if (io) { try { io.emit(event, payload); } catch {} } }
 
-function normalizeStatus(s) {
-  if (!s) return '';
-  return String(s).trim().toLowerCase();
-}
-function isConnectedSession(state) {
-  if (!state?.client) return false;
-  const s = normalizeStatus(state?.status?.status);
-  const ok = ['islogged','inchat','qrreadsuccess','connected','logged','online','main','normal'];
-  return ok.includes(s);
-}
-function cleanMediaPath(p) {
-  return (p && String(p).trim()) ? p : null;
-}
-function textOf(x) {
-  return String(x || '').trim();
-}
-function safeBasename(p) {
-  try { return path.basename(p); } catch { return 'file'; }
-}
 function parseSqliteTs(ts) {
   if (!ts) return null;
   const hasTZ = /[+-]\d{2}:\d{2}|Z$/i.test(ts);
@@ -82,6 +79,7 @@ function parseSqliteTs(ts) {
   const parsed = new Date(hasTZ ? isoish : `${isoish}Z`);
   return isNaN(parsed) ? null : parsed;
 }
+
 function isEmptySnapshotMessage(m) {
   if (!m) return true;
   const txt = textOf(m.text);
@@ -90,18 +88,26 @@ function isEmptySnapshotMessage(m) {
   const vid = cleanMediaPath(m.video_path);
   return !txt && !img && !aud && !vid;
 }
-function fileSizeOK(fp) {
-  try { return fs.statSync(fp).size <= MAX_MEDIA_BYTES; } catch { return false; }
-}
-function ensureDir(p) { try { fs.mkdirSync(p, { recursive: true }); } catch {} }
 
-// Emite (inclui {session} quando útil)
-function emit(event, payload) {
-  if (!io) return;
-  try { io.emit(event, payload); } catch {}
+/** =========================
+ *  Conectividade/estados
+ *  ========================= */
+const CONNECTED_STATES = new Set([
+  'islogged','inchat','qrreadsuccess','connected','logged','online','main','normal'
+]);
+
+function isConnectedSession(state) {
+  if (!state?.client) return false;
+  return CONNECTED_STATES.has(normalizeStatus(state?.status?.status));
 }
 
-// ===== Grupos =====
+function isReadyForGroups(state) {
+  try {
+    const st = (state?.status?.status || '').toString().toLowerCase().trim();
+    return CONNECTED_STATES.has(st);
+  } catch { return false; }
+}
+
 async function _isReallyLogged(state) {
   try {
     if (!state?.client) return false;
@@ -111,64 +117,94 @@ async function _isReallyLogged(state) {
   }
 }
 
-// Preferir getAllGroups(true); fallback p/ listChats() e getAllChats()
-async function getGroupsSafe(session, maxRetries = 5) {
+/** =========================
+ *  Coleta de grupos (robusta)
+ *  ========================= */
+async function getGroupsSafe(session, maxRetries = 8) {
   const state = sessions.get(session);
   if (!state?.client) return [];
   let lastErr = null;
+  let lastGateReason = '';
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      // gate: só tenta se de fato logado/sync ativo
-      const ok = await _isReallyLogged(state);
-      if (!ok) {
-        await sleep(800 + attempt * 200);
+      const logged = await _isReallyLogged(state);
+      const readyByState = isReadyForGroups(state);
+
+      if (!(logged || readyByState)) {
+        lastGateReason = `gate:not-ready (isLogged=${logged}, status=${state?.status?.status || '-'})`;
+        await sleep(800 + attempt * 250);
         continue;
       }
 
-      let out = [];
-
-      if (typeof state.client.getAllGroups === 'function') {
-        // includeParticipating = true
-        const list = await state.client.getAllGroups(true);
-        out = (list || []).map((g) => ({
-          id: g?.id?._serialized || g?.id || g?.wid?._serialized || g?.wid || '',
-          name: g?.name || g?.subject || g?.formattedTitle || g?.groupMetadata?.subject || 'Grupo',
-        })).filter(x => typeof x.id === 'string' && x.id.endsWith('@g.us'));
-      } else if (typeof state.client.listChats === 'function') {
-        const chats = await state.client.listChats();
-        out = (chats || []).map((c) => ({
-          id: c?.id?._serialized || c?.id || '',
-          name: c?.name || c?.formattedTitle || c?.groupMetadata?.subject || 'Grupo',
-        })).filter(x => typeof x.id === 'string' && x.id.endsWith('@g.us'));
-      } else if (typeof state.client.getAllChats === 'function') {
+      // Preferência 1: getAllChats (WA-JS)
+      if (typeof state.client.getAllChats === 'function') {
         const chats = await state.client.getAllChats();
-        out = (chats || []).map((c) => ({
-          id: c?.id?._serialized || c?.id || '',
-          name: c?.name || c?.formattedTitle || 'Grupo',
-        })).filter(x => typeof x.id === 'string' && x.id.endsWith('@g.us'));
-      } else {
-        throw new Error('No suitable API (getAllGroups/listChats/getAllChats)');
+        const out = (chats || [])
+          .map(c => {
+            const id =
+              c?.id?._serialized || c?.id ||
+              c?.wid?._serialized || c?.wid || '';
+            const name =
+              c?.name || c?.formattedTitle || c?.subject ||
+              c?.groupMetadata?.subject || 'Grupo';
+            const isGroup = c?.isGroup === true || (typeof id === 'string' && id.endsWith('@g.us'));
+            return isGroup ? { id, name } : null;
+          })
+          .filter(Boolean)
+          .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+        if (out.length) return out;
       }
 
-      out.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
-      return out;
+      // Preferência 2: listChats (WPPConnect wrapper antigo)
+      if (typeof state.client.listChats === 'function') {
+        const chats = await state.client.listChats();
+        const out = (chats || [])
+          .map(c => {
+            const id = c?.id?._serialized || c?.id || '';
+            const name = c?.name || c?.formattedTitle || c?.groupMetadata?.subject || 'Grupo';
+            return (typeof id === 'string' && id.endsWith('@g.us')) ? { id, name } : null;
+          })
+          .filter(Boolean)
+          .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+        if (out.length) return out;
+      }
+
+      // Preferência 3: getAllGroups (depende da versão)
+      if (typeof state.client.getAllGroups === 'function') {
+        let groups = [];
+        try { groups = await state.client.getAllGroups(); } catch {
+          try { groups = await state.client.getAllGroups(true); } catch {}
+        }
+        const out = (groups || [])
+          .map(g => ({
+            id: g?.id?._serialized || g?.id || g?.wid?._serialized || g?.wid || '',
+            name: g?.name || g?.subject || g?.formattedTitle || g?.groupMetadata?.subject || 'Grupo',
+          }))
+          .filter(x => typeof x.id === 'string' && x.id.endsWith('@g.us'))
+          .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+        if (out.length) return out;
+      }
+
+      // Nenhuma API trouxe grupos — esperar sync
+      await sleep(1000 + attempt * 300);
     } catch (e) {
       lastErr = e;
-      console.warn(`[${session}] getGroupsSafe attempt ${attempt} failed:`, e?.message || e);
-      // Em casos de "Runtime.callFunctionOn timed out" / "Target closed", dá um respiro maior
-      await sleep(1000 * attempt); // backoff linear
+      await sleep(1000 + attempt * 500); // backoff
     }
   }
 
-  console.warn(
-    `[${session}] getGroupsSafe falhou após retries:`,
-    lastErr?.message || lastErr
-  );
+  if (lastErr) {
+    console.warn(`[${session}] getGroupsSafe falhou após retries (err):`, lastErr?.message || lastErr);
+  } else {
+    console.warn(
+      `[${session}] getGroupsSafe falhou após retries (gate):`,
+      lastGateReason || 'unknown'
+    );
+  }
   return [];
 }
 
-// Persiste (DB) e retorna
 async function ensureGroupsPersisted(session) {
   const st = getStore(session);
   const groups = await getGroupsSafe(session);
@@ -176,11 +212,8 @@ async function ensureGroupsPersisted(session) {
   return groups;
 }
 
-// Refresh explícito, com emissão opcional e múltiplas passadas (espera sync do WA)
-async function refreshGroups(
-  session,
-  { emitSocket = true, delaySeries = [0, 1500, 6000, 12000, 20000] } = {}
-) {
+// refresh com múltiplas passadas (espera sync do WA-Web)
+async function refreshGroups(session, { emitSocket = true, delaySeries = [0, 2000, 7000, 15000, 30000] } = {}) {
   let last = [];
   for (const d of delaySeries) {
     if (d > 0) await sleep(d);
@@ -199,18 +232,19 @@ function shouldTargetGroup(session, groupId) {
   return selected.includes(groupId);
 }
 
-// ===== Resolução de mensagem (suporta video_path) =====
+/** =========================
+ *  Resolução de mensagem
+ *  ========================= */
 async function resolveEffectiveMessage(session, groupId) {
   const st = getStore(session);
   const settings = st.getSettings();
   const preset = st.getGroupPreset(groupId) || null;
 
-  // 1) PRESET
+  // 1) PRESET snapshot (com rotação)
   if (preset) {
     const msgs = Array.isArray(preset.messages) ? preset.messages : [];
     const rIdx = Number.isFinite(preset.rotate_index) ? Number(preset.rotate_index) : 0;
 
-    // 1.1) Snapshot com rotação
     if (msgs.length > 0) {
       const safeIndex = ((rIdx % msgs.length) + msgs.length) % msgs.length;
       const cand = msgs[safeIndex] || null;
@@ -227,7 +261,7 @@ async function resolveEffectiveMessage(session, groupId) {
       }
     }
 
-    // 1.2) Template por grupo
+    // 1.2) PRESET por template
     if (preset.template_id != null) {
       if (st.templateExists(preset.template_id)) {
         const tpl = st.getTemplate(preset.template_id);
@@ -251,9 +285,9 @@ async function resolveEffectiveMessage(session, groupId) {
     }
   }
 
-  // 2) GLOBAL
-  if (settings.global_template_id != null && getStore(session).templateExists(settings.global_template_id)) {
-    const tpl = getStore(session).getTemplate(settings.global_template_id);
+  // 2) GLOBAL template
+  if (settings.global_template_id != null && st.templateExists(settings.global_template_id)) {
+    const tpl = st.getTemplate(settings.global_template_id);
     const txt = textOf(tpl?.text);
     const img = cleanMediaPath(tpl?.image_path);
     const aud = cleanMediaPath(tpl?.audio_path);
@@ -267,8 +301,9 @@ async function resolveEffectiveMessage(session, groupId) {
     }
   }
 
+  // 3) GLOBAL random
   if (settings.random_mode) {
-    const rtpl = getStore(session).pickRandomTemplate();
+    const rtpl = st.pickRandomTemplate();
     if (rtpl) {
       return {
         text: textOf(rtpl.text),
@@ -281,7 +316,7 @@ async function resolveEffectiveMessage(session, groupId) {
     }
   }
 
-  // 2.3) Texto/mídia globais
+  // 4) Plain global
   return {
     text: textOf(settings.text_message),
     image_path: cleanMediaPath(settings.image_path),
@@ -292,7 +327,9 @@ async function resolveEffectiveMessage(session, groupId) {
   };
 }
 
-// ===== Envio de preset (com .mp4 até 16MB) =====
+/** =========================
+ *  Envio (texto/imagem/áudio/vídeo)
+ *  ========================= */
 async function sendPresetToGroup(session, groupId) {
   const state = sessions.get(session);
   if (!state?.client) return;
@@ -343,7 +380,9 @@ async function sendPresetToGroup(session, groupId) {
   }
 }
 
-// ===== Handler de mensagens (default) =====
+/** =========================
+ *  Handler de mensagens
+ *  ========================= */
 async function onIncomingMessage(session, msg) {
   const state = sessions.get(session);
   if (!state?.client) return;
@@ -377,7 +416,7 @@ async function onIncomingMessage(session, msg) {
 
     if (!shouldTargetGroup(session, groupId)) return;
 
-    // contador + broadcast
+    // contador + socket
     getStore(session).increment(groupId);
     emit('counter:update', { ...(getStore(session).getCounter(groupId) || {}), session });
 
@@ -413,19 +452,19 @@ async function onIncomingMessage(session, msg) {
   }
 }
 
-// ===== Lifecycle =====
-const CONNECTED_STATES = new Set(['islogged','inchat','qrreadsuccess','connected','logged','online','main','normal']);
-
+/** =========================
+ *  Lifecycle / criação da sessão
+ *  ========================= */
 function scheduleRefreshOnConnect(session, statusStr) {
   const st = normalizeStatus(statusStr);
   if (!CONNECTED_STATES.has(st)) return;
-  // Faz passadas para pegar grupos logo após a sync do WA (janela maior)
-  refreshGroups(session, { emitSocket: true, delaySeries: [0, 1500, 6000, 12000, 20000] })
+  // janela maior para completar sync de chats/grupos
+  refreshGroups(session, { emitSocket: true, delaySeries: [0, 2000, 7000, 15000, 30000] })
     .catch((e) => console.warn(`[${session}] refresh pós-conexão falhou:`, e?.message));
 }
 
 async function _reallyStartSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
-  // reemite status/QR se já conectado
+  // Se já conectado, apenas reemite status/QR
   let state = sessions.get(session);
   if (state && isConnectedSession(state)) {
     emit('wpp:status', { ...(state.status || {}), session, hasClient: !!state.client, hasQR: !!state.qrBase64 });
@@ -433,12 +472,12 @@ async function _reallyStartSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
     return state.client;
   }
 
-  // fecha cliente zumbi (SEM logout)
+  // Fecha cliente zumbi (sem logout)
   if (state?.client) {
     try { await state.client.close?.(); } catch {}
   }
 
-  // novo estado
+  // Novo estado
   state = {
     client: null,
     status: { status: 'STARTING' },
@@ -451,18 +490,15 @@ async function _reallyStartSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
   sessions.set(session, state);
   emit('wpp:status', { ...(state.status), session });
 
-  // pastas persistentes
+  // Estrutura de pastas persistentes por sessão
   ensureDir(path.join(__dirname, '..', WPP_DATA_DIR, session));
-
-  // caminhos dedicados por sessão
   const sessionRoot = path.join(WPP_DATA_DIR, session);
-  const tokenDir = path.join(sessionRoot, 'tokens');     // onde salvamos tokens
-  const profileDir = path.join(sessionRoot, 'profile');  // perfil do Chromium
-
+  const tokenDir = path.join(sessionRoot, 'tokens');     // tokens
+  const profileDir = path.join(sessionRoot, 'profile');  // perfil Chromium
   ensureDir(path.join(__dirname, '..', tokenDir));
   ensureDir(path.join(__dirname, '..', profileDir));
 
-  // CreateOptions: tokens em arquivo + perfil isolado por sessão
+  // Opções de criação
   const createOpts = {
     session,
 
@@ -470,7 +506,6 @@ async function _reallyStartSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
     folderNameToken: tokenDir,
 
     waitForLogin: true,
-    // impedir “Auto Close Called” (desativado via 0/false)
     autoClose: WPP_AUTO_CLOSE,
     deviceSyncTimeout: WPP_DEVICE_SYNC_TIMEOUT,
 
@@ -490,7 +525,7 @@ async function _reallyStartSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
-        '--no-zygote'
+        '--no-zygote',
       ],
     },
 
@@ -509,7 +544,6 @@ async function _reallyStartSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
     statusFind: (statusSession) => {
       state.status = { status: statusSession };
       emit('wpp:status', { ...(state.status), session });
-      // Assim que “conectado”, força sync dos grupos
       scheduleRefreshOnConnect(session, statusSession);
     },
 
@@ -518,12 +552,11 @@ async function _reallyStartSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
     },
   };
 
-  // criação com fallback
+  // Cria cliente com 1 fallback limpando tokens, se necessário
   try {
     state.client = await wppconnect.create(createOpts);
   } catch (err) {
     console.warn(`[${session}] create() falhou: ${err?.message || err}`);
-    // último recurso: limpar tokens e tentar novamente 1x
     try { cleanupSessionData(session); } catch {}
     await sleep(700);
     state.client = await wppconnect.create(createOpts);
@@ -546,13 +579,12 @@ async function _reallyStartSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
     if (typeof state.client?.onStateChange === 'function') {
       state.client.onStateChange((st) => {
         emit('wpp:state', { session, state: st });
-        // Dispara refresh quando o WebSocket volta
         scheduleRefreshOnConnect(session, st);
       });
     }
   } catch {}
 
-  // carga inicial de grupos (login “frio”: dá várias tentativas com backoff)
+  // carga inicial de grupos após login “frio” (várias tentativas com backoff)
   (async () => {
     for (const ms of [2000, 5000, 10000, 20000]) {
       await sleep(ms);
@@ -565,7 +597,6 @@ async function _reallyStartSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
   return state.client;
 }
 
-// start com lock (evita corrida com close)
 async function startSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
   if (creatingBySession.has(session)) return creatingBySession.get(session);
   const p = (async () => _reallyStartSession(session, hooks))()
@@ -574,18 +605,19 @@ async function startSession(session = SESSION_NAME_DEFAULT, hooks = {}) {
   return p;
 }
 
-// Wrapper compatível com o seu bot.js
 async function createSession(session = SESSION_NAME_DEFAULT, ioInstance = null, hooks = {}) {
   if (ioInstance) setIO(ioInstance);
   return startSession(session, hooks);
 }
 
-// (A) “Desconectar” NÃO deve deslogar
+/** =========================
+ *  Encerramento / Reset
+ *  ========================= */
 async function _closeOnly(session) {
   const state = sessions.get(session);
   try {
     if (state?.client) {
-      // NÃO deslogar! Apenas fechar o navegador para manter os tokens válidos.
+      // NÃO deslogar — só fecha o browser p/ manter tokens válidos
       await state.client.close?.();
     }
   } catch (e) {
@@ -611,48 +643,31 @@ async function closeSession(session = SESSION_NAME_DEFAULT) {
 }
 
 /**
- * Reset/Wipe definitivo da sessão:
+ * wipeSession:
  * - Fecha o cliente (sem logout)
- * - Remove diretório .wpp-data/<session> inteiro (tokens + perfil do Chromium)
- * - Faz retries com backoff (Windows/Linux podem segurar arquivos)
+ * - Remove .wpp-data/<session> (tokens + profile)
+ * - Faz retries com backoff
  */
 async function wipeSession(session = SESSION_NAME_DEFAULT) {
   await closeSession(session);
 
   const base = path.resolve(path.join(__dirname, '..', WPP_DATA_DIR));
   const target = path.resolve(path.join(base, session));
+  if (!target.startsWith(base)) throw new Error('Alvo inválido para wipe.');
 
-  // segurança: target deve estar DENTRO de base
-  if (!target.startsWith(base)) {
-    throw new Error('Alvo inválido para wipe.');
-  }
-
-  // tenta remover com retries/backoff
   let lastErr = null;
   for (let attempt = 0; attempt < 6; attempt++) {
     try {
       fs.rmSync(target, { recursive: true, force: true });
-      if (!fs.existsSync(target)) break; // sucesso
-    } catch (e) {
-      lastErr = e;
-    }
+      if (!fs.existsSync(target)) break;
+    } catch (e) { lastErr = e; }
     await sleep(250 * (attempt + 1));
   }
-
   if (fs.existsSync(target)) {
-    // tentativa “manual” extra (CHMOD e remoção recursiva)
-    try {
-      forceRemoveDir(target);
-    } catch (e) {
-      lastErr = e;
-    }
+    try { forceRemoveDir(target); } catch (e) { lastErr = e; }
   }
+  if (fs.existsSync(target)) throw lastErr || new Error('Falha ao limpar sessão: arquivos ainda em uso.');
 
-  if (fs.existsSync(target)) {
-    throw lastErr || new Error('Falha ao limpar sessão: arquivos ainda em uso.');
-  }
-
-  // mantém status coerente e notifica
   const state = sessions.get(session);
   if (state) {
     state.client = null;
@@ -665,7 +680,6 @@ async function wipeSession(session = SESSION_NAME_DEFAULT) {
   return true;
 }
 
-// Remove diretório mesmo em cenários “chatos”
 function forceRemoveDir(dir) {
   if (!fs.existsSync(dir)) return;
   for (const entry of fs.readdirSync(dir)) {
@@ -682,7 +696,9 @@ function forceRemoveDir(dir) {
   try { fs.rmdirSync(dir); } catch {}
 }
 
-// ===== Acesso/estado =====
+/** =========================
+ *  Getters / utilidades
+ *  ========================= */
 function getClient(session = SESSION_NAME_DEFAULT) {
   const st = sessions.get(session);
   return st?.client || null;
@@ -697,6 +713,7 @@ function getStatus(session = SESSION_NAME_DEFAULT) {
   if (!state) return { session, status: 'DISCONNECTED', hasClient: false, hasQR: false };
   return { session, ...(state.status || {}), hasClient: !!state.client, hasQR: !!state.qrBase64 };
 }
+
 function getQR(session = SESSION_NAME_DEFAULT) {
   const state = sessions.get(session);
   return state?.qrBase64 || null;
@@ -715,12 +732,12 @@ function listSessions() {
   return out;
 }
 
-// Remove somente a pasta da sessão (para "resetar" o login) — utilitário interno
+// Remove somente a pasta da sessão (reset do login)
 function cleanupSessionData(session = SESSION_NAME_DEFAULT) {
   try {
-    const tokenPath = path.join(__dirname, '..', WPP_DATA_DIR, session);
-    if (fs.existsSync(tokenPath)) {
-      fs.rmSync(tokenPath, { recursive: true, force: true });
+    const target = path.join(__dirname, '..', WPP_DATA_DIR, session);
+    if (fs.existsSync(target)) {
+      fs.rmSync(target, { recursive: true, force: true });
       return true;
     }
     return false;
@@ -730,6 +747,9 @@ function cleanupSessionData(session = SESSION_NAME_DEFAULT) {
   }
 }
 
+/** =========================
+ *  Exports
+ *  ========================= */
 module.exports = {
   // IO
   setIO,
@@ -738,7 +758,7 @@ module.exports = {
   startSession,
   createSession,
   closeSession,
-  wipeSession,          // reset definitivo
+  wipeSession,
   getClient,
   isConnected,
   getStatus,
@@ -749,12 +769,12 @@ module.exports = {
   // Grupos
   getGroupsSafe,
   ensureGroupsPersisted,
-  refreshGroups,        // refresh explícito pós-conexão e endpoint
+  refreshGroups,
 
   // Envio
   sendPresetToGroup,
 
-  // Acesso direto (debug)
+  // Debug
   _sessions: sessions,
   _getStore: getStore,
 };
